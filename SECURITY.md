@@ -20,3 +20,10 @@ Useful reports include a synthetic reproducer, the Task/Python/agent CLI version
 - The repository's CI uses no model-provider secrets. The manual source-bundle workflow does not publish a package or release.
 
 Never point the launcher at untrusted generated runtime files. Review configurations and any project-level agent hooks/settings before running an agent with access to your workspace.
+
+
+## Native installation
+
+`task install` explicitly writes selected credentials to real CLI homes; `task install:plan` previews destinations without writes or subprocesses. Use environment/secret-manager inputs, stop running CLIs, and review the selected profiles. Unlike isolated generation, native installation makes persisted credentials available to ordinary CLI launches. Native files and exact sibling backups contain secrets; do not commit them. On Unix these files use mode `0600`; Windows ACLs remain the user's responsibility.
+
+Native file replacements have backups and best-effort rollback. Copilot keychain login and OpenCode database imports are external operations and cannot be part of the same rollback transaction. Symlink targets and malformed existing files are rejected. JSONC/TOML comments and formatting are normalized during merging; original bytes remain in backups. CLI refresh locks cannot be coordinated portably, so do not install concurrently with an active session.

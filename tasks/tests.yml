@@ -765,6 +765,525 @@ vars:
 
     if __name__ == "__main__":
         unittest.main()
+  TEST_INSTALLER: |
+    import contextlib
+    import io
+    import json
+    import os
+    import sqlite3
+    import stat
+    import subprocess
+    import tempfile
+    import tomllib
+    import unittest
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from credenvoy import installer as install
+    from credenvoy import runtime
+
+
+    class InstallTests(unittest.TestCase):
+        def setUp(self):
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.home = Path(self.temp.name).resolve()
+            self.environment = patch.dict(
+                os.environ, {"TEST_KEY": 'SYNTHETIC-"key\\\nvalue'}, clear=True
+            )
+            self.environment.start()
+            self.addCleanup(self.environment.stop)
+            self.home_patch = patch("credenvoy.installer.Path.home", return_value=self.home)
+            self.home_patch.start()
+            self.addCleanup(self.home_patch.stop)
+
+        def profile(self, agent, provider="openai", **values):
+            return {"name": "sample", "agent": agent, "provider": provider, **values}
+
+        def apply(self, plan):
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.apply(plan)
+
+        def read(self, path):
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        def test_opencode_normal_location_merge_backups_and_repeat(self):
+            path = self.home / ".local/share/opencode/auth.json"
+            path.parent.mkdir(parents=True)
+            original = {
+                "other": {"type": "api", "key": "KEEP"},
+                "openai": {"type": "oauth", "refresh": "OLD"},
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+            plan = install.Installation()
+            profile = self.profile("opencode-v1", api_key_env="TEST_KEY")
+            plan.add(profile)
+            self.apply(plan)
+            result = self.read(path)
+            self.assertEqual(result["other"], original["other"])
+            self.assertEqual(
+                result["openai"], {"type": "api", "key": os.environ["TEST_KEY"]}
+            )
+            backup = next(path.parent.glob("auth.json.credenvoy-backup-*"))
+            self.assertEqual(self.read(backup), original)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+            again = install.Installation()
+            again.add(profile)
+            self.apply(again)
+            self.assertEqual(len(list(path.parent.glob("auth.json.credenvoy-backup-*"))), 1)
+            self.assertFalse((self.home / "generated").exists())
+
+        def test_all_native_home_overrides_and_xdg(self):
+            overrides = {
+                "CODEX_HOME": "codex",
+                "CLAUDE_CONFIG_DIR": "claude",
+                "PI_CODING_AGENT_DIR": "pi",
+                "COPILOT_HOME": "copilot",
+            }
+            for variable, agent in overrides.items():
+                with (
+                    self.subTest(agent=agent),
+                    patch.dict(os.environ, {variable: str(self.home / agent)}),
+                ):
+                    self.assertEqual(install.destinations(agent)[0], self.home / agent)
+            with patch.dict(
+                os.environ,
+                {
+                    "XDG_DATA_HOME": str(self.home / "data"),
+                    "XDG_CONFIG_HOME": str(self.home / "config"),
+                    "OPENCODE_CONFIG": str(self.home / "custom.json"),
+                },
+            ):
+                data, config = install.destinations("opencode-v1")
+                self.assertEqual(data, self.home / "data/opencode")
+                self.assertEqual(config, self.home / "custom.json")
+            with patch.dict(os.environ, {"CODEX_HOME": "relative"}):
+                with self.assertRaises(install.InstallError):
+                    install.destinations("codex")
+
+        def test_pi_persists_key_without_env_or_command_interpretation(self):
+            with patch.dict(os.environ, {"TEST_KEY": "!do-not-run ${SECRET}$TOKEN"}):
+                plan = install.Installation()
+                plan.add(
+                    self.profile("pi", "groq", api_key_env="TEST_KEY", model="synthetic")
+                )
+                self.apply(plan)
+            entry = self.read(self.home / ".pi/agent/auth.json")["groq"]
+            self.assertEqual(entry["key"], "$!do-not-run $${SECRET}$$TOKEN")
+            self.assertEqual(
+                self.read(self.home / ".pi/agent/settings.json")["defaultProvider"], "groq"
+            )
+
+        def test_pi_cloud_env_uses_provider_scoped_stored_credentials(self):
+            plan = install.Installation()
+            plan.add(self.profile("pi", "amazon-bedrock", env={"AWS_PROFILE": "TEST_KEY"}))
+            self.apply(plan)
+            self.assertEqual(
+                self.read(self.home / ".pi/agent/auth.json")["amazon-bedrock"]["env"][
+                    "AWS_PROFILE"
+                ],
+                os.environ["TEST_KEY"],
+            )
+
+        def test_codex_subscription_replaces_identity_and_preserves_other_config(self):
+            home = self.home / ".codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'profile = "old"\nmodel_provider = "old"\n[projects."/work"]\ntrust_level = "trusted"\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text(
+                '{"OPENAI_API_KEY":"OLD","tokens":{"refresh_token":"OLD"}}',
+                encoding="utf-8",
+            )
+            native = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "refresh_token": "SYNTHETIC",
+                    "account_id": "ACCOUNT",
+                    "unknown": "PRESERVE",
+                },
+            }
+            with patch.dict(os.environ, {"NATIVE": json.dumps(native)}):
+                plan = install.Installation()
+                plan.add(self.profile("codex", native_auth_json_env="NATIVE"))
+                self.apply(plan)
+            self.assertEqual(self.read(home / "auth.json"), native)
+            config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(config["projects"]["/work"]["trust_level"], "trusted")
+            self.assertEqual(config["model_provider"], "openai")
+            self.assertEqual(config["forced_login_method"], "chatgpt")
+            self.assertNotIn("profile", config)
+
+        def test_codex_custom_credentials_survive_without_original_environment(self):
+            plan = install.Installation()
+            plan.add(
+                self.profile(
+                    "codex",
+                    "custom",
+                    api_key_env="TEST_KEY",
+                    base_url="https://synthetic.invalid/v1",
+                    protocol="openai-responses",
+                )
+            )
+            self.apply(plan)
+            config = tomllib.loads(
+                (self.home / ".codex/config.toml").read_text(encoding="utf-8")
+            )
+            provider = config["model_providers"][config["model_provider"]]
+            self.assertEqual(provider["experimental_bearer_token"], os.environ["TEST_KEY"])
+            self.assertNotIn("env_key", provider)
+            plan = install.Installation()
+            plan.add(
+                self.profile(
+                    "codex",
+                    "custom",
+                    api_key_env="TEST_KEY",
+                    base_url="https://synthetic.invalid/v1",
+                    protocol="openai-responses",
+                    api_key_header="api-key",
+                )
+            )
+            self.apply(plan)
+            provider = tomllib.loads(
+                (self.home / ".codex/config.toml").read_text(encoding="utf-8")
+            )["model_providers"]["credenvoy_sample"]
+            self.assertEqual(provider["http_headers"]["api-key"], os.environ["TEST_KEY"])
+            self.assertNotIn("experimental_bearer_token", provider)
+
+        def test_claude_settings_keep_permissions_and_other_env(self):
+            path = self.home / ".claude/settings.json"
+            path.parent.mkdir()
+            path.write_text(
+                '{"permissions":{"deny":["Bash(rm:*)"]},"env":{"KEEP":"VALUE"}}',
+                encoding="utf-8",
+            )
+            plan = install.Installation()
+            plan.add(self.profile("claude", "anthropic", api_key_env="TEST_KEY"))
+            self.apply(plan)
+            config = self.read(path)
+            self.assertEqual(config["permissions"]["deny"], ["Bash(rm:*)"])
+            self.assertEqual(config["env"]["KEEP"], "VALUE")
+            self.assertEqual(config["env"]["ANTHROPIC_API_KEY"], os.environ["TEST_KEY"])
+
+        def test_claude_subscription_removes_competing_stored_api_and_cloud_selectors(self):
+            path = self.home / ".claude/settings.json"
+            path.parent.mkdir()
+            path.write_text(
+                json.dumps(
+                    {
+                        "apiKeyHelper": "old-helper",
+                        "env": {
+                            "ANTHROPIC_API_KEY": "OLD",
+                            "CLAUDE_CODE_USE_BEDROCK": "1",
+                            "KEEP": "VALUE",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"NATIVE": json.dumps({"claudeAiOauth": {"accessToken": "SYNTHETIC"}})},
+            ):
+                plan = install.Installation()
+                plan.add(self.profile("claude", "anthropic", native_auth_json_env="NATIVE"))
+                self.apply(plan)
+            result = self.read(path)
+            self.assertEqual(result["env"], {"KEEP": "VALUE"})
+            self.assertNotIn("apiKeyHelper", result)
+
+        def test_all_matrix_install_plans_use_native_destinations_or_explicitly_reject(
+            self,
+        ):
+            from credenvoy import compiler
+            from credenvoy.tests.test_compiler import synthetic_environment
+
+            with patch.dict(os.environ, synthetic_environment(), clear=True):
+                for row in compiler.matrix():
+                    if row["route"].startswith("unsupported"):
+                        continue
+                    request = {**row, "model": "synthetic-model"}
+                    if row["route"] == "gateway-required":
+                        request["endpoint"] = {
+                            "protocol": "anthropic-messages"
+                            if row["agent"] == "claude"
+                            else "openai-responses"
+                            if row["agent"] == "codex"
+                            else "openai-completions",
+                            "base_url_env": "GATEWAY_URL",
+                            "key_env": "GATEWAY_KEY",
+                        }
+                    with self.subTest(**row):
+                        profile = compiler.compile_profile(request)
+                        plan = install.Installation()
+                        try:
+                            plan.add(profile)
+                        except install.InstallError as error:
+                            self.assertRegex(str(error), "task run")
+                        else:
+                            self.assertTrue(plan.files or plan.commands)
+                            for path in plan.files:
+                                self.assertTrue(path.is_relative_to(self.home))
+                                self.assertNotIn("generated", path.parts)
+            self.assertFalse((self.home / ".local").exists())
+
+        def test_jsonc_and_toml_unrelated_values_roundtrip(self):
+            config = self.home / ".config/opencode/opencode.jsonc"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                '{// comment\n"mcp":{"url":"https://example.invalid/*KEEP*/",},}',
+                encoding="utf-8",
+            )
+            plan = install.Installation()
+            plan.add(self.profile("opencode-v1", api_key_env="TEST_KEY", model="synthetic"))
+            self.apply(plan)
+            self.assertEqual(
+                self.read(config)["mcp"]["url"], "https://example.invalid/*KEEP*/"
+            )
+            values = tomllib.loads(
+                'date = 2030-01-01\n[[servers]]\nname = "keep"\n[servers.nested]\nvalues = [true, 2, "ok"]\n'
+            )
+            self.assertEqual(
+                tomllib.loads(install.serialize(values, True).decode()), values
+            )
+
+        def test_plan_no_files_no_subprocess_and_conflicts_fail_before_install(self):
+            plan = install.Installation()
+            plan.add(self.profile("opencode-v1", api_key_env="TEST_KEY"))
+            with (
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    side_effect=AssertionError("must not run"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                plan.describe()
+            self.assertNotIn(os.environ["TEST_KEY"], out.getvalue())
+            self.assertFalse((self.home / ".local").exists())
+            with self.assertRaises(install.InstallError):
+                plan.add(
+                    self.profile("opencode-v1", api_key_env="TEST_KEY", model="conflict")
+                )
+            self.assertFalse((self.home / ".local").exists())
+
+        def test_invalid_existing_files_symlinks_and_changes_are_not_overwritten(self):
+            target = self.home / ".local/share/opencode/auth.json"
+            target.parent.mkdir(parents=True)
+            target.write_text("INVALID SYNTHETIC SECRET", encoding="utf-8")
+            with self.assertRaises(install.InstallError):
+                install.Installation().add(
+                    self.profile("opencode-v1", api_key_env="TEST_KEY")
+                )
+            target.unlink()
+            plan = install.Installation()
+            plan.add(self.profile("opencode-v1", api_key_env="TEST_KEY"))
+            target.write_text('{"new":"REFRESHED"}', encoding="utf-8")
+            with self.assertRaises(install.InstallError):
+                self.apply(plan)
+            self.assertEqual(self.read(target), {"new": "REFRESHED"})
+            target.unlink()
+            try:
+                target.symlink_to(self.home / "physical.json")
+            except (OSError, NotImplementedError):
+                return  # Windows may not grant symlink creation privileges.
+            with self.assertRaises(install.InstallError):
+                install.Installation().add(
+                    self.profile("opencode-v1", api_key_env="TEST_KEY")
+                )
+
+        def test_native_commands_use_stdin_preflight_and_database_backup(self):
+            db = self.home / ".local/share/opencode/opencode.db"
+            db.parent.mkdir(parents=True)
+            with sqlite3.connect(db) as connection:
+                connection.execute("CREATE TABLE keep (value TEXT)")
+                connection.execute("INSERT INTO keep VALUES ('KEEP')")
+            plan = install.Installation()
+            plan.add(
+                self.profile(
+                    "opencode-v2", api_key_env="TEST_KEY", credential_id="synthetic"
+                )
+            )
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                side_effect=[
+                    SimpleNamespace(stdout="--standalone", stderr=""),
+                    SimpleNamespace(stdout="2.0.0", stderr=""),
+                    SimpleNamespace(stdout="[]", stderr=""),
+                    SimpleNamespace(stdout="", stderr=""),
+                ],
+            ) as call:
+                self.apply(plan)
+            self.assertEqual(call.call_count, 4)
+            args, kwargs = call.call_args
+            self.assertEqual(args[0], ["opencode", "auth", "import", "--standalone"])
+            self.assertEqual(
+                json.loads(kwargs["input"])[0]["value"]["key"], os.environ["TEST_KEY"]
+            )
+            self.assertNotIn(os.environ["TEST_KEY"], str(args))
+            backup = next(db.parent.glob("opencode.db.credenvoy-backup-*"))
+            with sqlite3.connect(backup) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM keep").fetchone(), ("KEEP",)
+                )
+
+        def test_v2_conflicting_existing_credentials_fail_before_file_writes(self):
+            db = self.home / ".local/share/opencode/opencode.db"
+            db.parent.mkdir(parents=True)
+            with sqlite3.connect(db):
+                pass
+            plan = install.Installation()
+            plan.add(
+                self.profile(
+                    "opencode-v2", api_key_env="TEST_KEY", credential_id="synthetic"
+                )
+            )
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            results = [
+                SimpleNamespace(stdout="--standalone", stderr=""),
+                SimpleNamespace(stdout="2.0.0", stderr=""),
+                SimpleNamespace(
+                    stdout=json.dumps(
+                        [
+                            {
+                                "id": "other",
+                                "integrationID": "openai",
+                                "value": {"key": "EXISTING"},
+                                "active": True,
+                            }
+                        ]
+                    ),
+                    stderr="",
+                ),
+            ]
+            with patch("credenvoy.installer.subprocess.run", side_effect=results):
+                with self.assertRaises(install.InstallError):
+                    self.apply(plan)
+            self.assertFalse((self.home / ".pi").exists())
+
+        def test_copilot_login_uses_native_store_and_suppresses_output(self):
+            plan = install.Installation()
+            plan.add(self.profile("copilot", "github-copilot", github_oauth_env="TEST_KEY"))
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                return_value=SimpleNamespace(stdout="--with-token", stderr=""),
+            ) as call:
+                self.apply(plan)
+            args, kwargs = call.call_args
+            self.assertEqual(args[0], ["copilot", "login", "--with-token"])
+            self.assertEqual(kwargs["input"], os.environ["TEST_KEY"] + "\n")
+            self.assertTrue(kwargs["capture_output"])
+
+        def test_missing_native_capability_prevents_all_writes(self):
+            plan = install.Installation()
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            plan.add(self.profile("copilot", "github-copilot", github_oauth_env="TEST_KEY"))
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                return_value=SimpleNamespace(stdout="", stderr=""),
+            ):
+                with self.assertRaises(install.InstallError):
+                    self.apply(plan)
+            self.assertFalse((self.home / ".pi").exists())
+
+        def test_failed_native_command_restores_files(self):
+            plan = install.Installation()
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            plan.add(self.profile("copilot", "github-copilot", github_oauth_env="TEST_KEY"))
+            failure = subprocess.CalledProcessError(1, "copilot", output="SYNTHETIC SECRET")
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                side_effect=[SimpleNamespace(stdout="--with-token", stderr=""), failure],
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.apply(plan)
+            self.assertFalse((self.home / ".pi/agent/auth.json").exists())
+
+        def test_exported_engine_install_one_call_with_profile_selection(self):
+            engine = self.home / "engine.py"
+            engine.write_text(runtime.engine_program(), encoding="utf-8")
+            env = {
+                **os.environ,
+                "PI_CODING_AGENT_DIR": str(self.home / "native-pi"),
+                "AGENTCFG_PROFILE": "pi-groq",
+                "GROQ_API_KEY": "SYNTHETIC-PERSISTED",
+                "AGENT_CONFIG_SPEC": json.dumps(
+                    {
+                        "profiles": [
+                            {
+                                "name": "pi-groq",
+                                "agent": "pi",
+                                "provider": "groq",
+                                "auth": "api_key",
+                                "model": "synthetic",
+                            },
+                            {"name": "unused", "agent": "INVALID"},
+                        ]
+                    }
+                ),
+            }
+            result = subprocess.run(
+                [os.sys.executable, str(engine), "install"],
+                env=env,
+                capture_output=True,
+                text=True,
+                cwd=self.home,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                self.read(self.home / "native-pi/auth.json")["groq"]["key"],
+                "SYNTHETIC-PERSISTED",
+            )
+            self.assertNotIn("SYNTHETIC-PERSISTED", result.stdout + result.stderr)
+            self.assertFalse((self.home / "generated").exists())
+
+        def test_environment_only_routes_fail_honestly_before_writes(self):
+            for agent in ("opencode-v1", "opencode-v2", "codex"):
+                with self.subTest(agent=agent), self.assertRaises(install.InstallError):
+                    install.Installation().add(
+                        self.profile(
+                            agent, "amazon-bedrock", env={"AWS_PROFILE": "TEST_KEY"}
+                        )
+                    )
+            with self.assertRaises(install.InstallError):
+                install.Installation().add(
+                    self.profile(
+                        "copilot",
+                        api_key_env="TEST_KEY",
+                        base_url="https://synthetic.invalid",
+                        model="synthetic",
+                    )
+                )
+
+        def test_opencode_installed_major_mismatch_prevents_writes(self):
+            plan = install.Installation()
+            plan.add(self.profile("opencode-v1", api_key_env="TEST_KEY"))
+            with (
+                patch("credenvoy.installer.shutil.which", return_value="opencode"),
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    return_value=SimpleNamespace(stdout="2.0.0", stderr=""),
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    self.apply(plan)
+            self.assertFalse((self.home / ".local").exists())
+
+        def test_mixed_opencode_majors_rejected(self):
+            plan = install.Installation()
+            plan.add(self.profile("opencode-v1", api_key_env="TEST_KEY"))
+            with self.assertRaises(install.InstallError):
+                plan.add(
+                    self.profile(
+                        "opencode-v2",
+                        "anthropic",
+                        api_key_env="TEST_KEY",
+                        credential_id="synthetic",
+                    )
+                )
 tasks:
   run:
     internal: true
@@ -776,3 +1295,5 @@ tasks:
         TEST_RENDERER: '{{.TEST_RENDERER}}'
         TEST_COMPILER: '{{.TEST_COMPILER}}'
         TEST_LAUNCHER: '{{.TEST_LAUNCHER}}'
+        TEST_INSTALLER: '{{.TEST_INSTALLER}}'
+

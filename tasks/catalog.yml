@@ -1039,4 +1039,6 @@ tasks:
         TEST_RENDERER: '{{if eq .ACTION "test"}}{{.TEST_RENDERER}}{{end}}'
         TEST_COMPILER: '{{if eq .ACTION "test"}}{{.TEST_COMPILER}}{{end}}'
         TEST_LAUNCHER: '{{if eq .ACTION "test"}}{{.TEST_LAUNCHER}}{{end}}'
+        TEST_INSTALLER: '{{if eq .ACTION "test"}}{{.TEST_INSTALLER}}{{end}}'
         SHOWCASE: '{{.CATALOG_SHOWCASE}}'
+

@@ -45,6 +45,7 @@ jobs:
         shell: python
         run: |
           import json
+          import os
           import pathlib
           import shutil
           import subprocess
@@ -64,5 +65,30 @@ jobs:
               assert matrix['agent_count'] == 6
               assert len(matrix['cells']) == 288
 
+              # Exercise the public installation tasks with a synthetic native home.
+              native_home = root.resolve() / 'native-pi'
+              environment = {
+                  **os.environ,
+                  'PI_CODING_AGENT_DIR': str(native_home),
+                  'GROQ_API_KEY': 'SYNTHETIC-CI-KEY',
+                  'AGENT_CONFIG_SPEC': json.dumps({'profiles': [{
+                      'name': 'ci-pi', 'agent': 'pi', 'provider': 'groq',
+                      'auth': 'api_key', 'model': 'synthetic-model',
+                  }]}),
+              }
+              environment.pop('AGENTCFG_PROFILE', None)
+              for action in ('install:plan', 'install'):
+                  result = subprocess.run(
+                      ['task', action], cwd=root, env=environment,
+                      check=True, capture_output=True, text=True,
+                  )
+                  assert 'SYNTHETIC-CI-KEY' not in result.stdout + result.stderr
+                  if action == 'install:plan':
+                      assert not native_home.exists()
+              auth = json.loads((native_home / 'auth.json').read_text(encoding='utf-8'))
+              assert auth['groq']['key'] == 'SYNTHETIC-CI-KEY'
+              assert not (root / 'generated').exists()
+
       - name: Check generated examples for drift
         run: task examples:check
+
