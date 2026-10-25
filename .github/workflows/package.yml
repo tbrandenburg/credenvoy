@@ -23,7 +23,9 @@ jobs:
         with:
           version: '3.54.0'
       - name: Validate source
-        run: task check
+        run: |
+          task check
+          task examples:check
       - name: Create a source-only archive
         run: git archive --format=zip --prefix=credenvoy/ --output=credenvoy.zip HEAD
       - name: Retain source bundle

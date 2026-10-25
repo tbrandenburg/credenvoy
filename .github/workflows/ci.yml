@@ -63,3 +63,6 @@ jobs:
               assert matrix['provider_count'] == 44
               assert matrix['agent_count'] == 6
               assert len(matrix['cells']) == 288
+
+      - name: Check generated examples for drift
+        run: task examples:check

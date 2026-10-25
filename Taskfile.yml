@@ -106,3 +106,24 @@ tasks:
     - task: lint
     - task: test
     - task: smoke
+  examples:
+    desc: Print generated credential walkthroughs using synthetic data
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: examples
+  examples:write:
+    desc: Refresh EXAMPLES.md using the actual compiler and serializers
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: examples:write
+  examples:check:
+    desc: Fail if EXAMPLES.md differs from generated synthetic examples
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: examples:check
