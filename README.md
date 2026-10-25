@@ -11,7 +11,7 @@
 [![Runtime dependencies: stdlib](https://img.shields.io/badge/runtime-Python_standard_library-596579)](#quick-start)
 [![License: MIT](https://img.shields.io/badge/license-MIT-7C3AED)](LICENSE)
 
-[Quick start](#quick-start) · [Commands](#commands) · [Subscriptions](#subscription-access) · [Compatibility](#compatibility) · [Contributing](AGENTS.md)
+[Quick start](#quick-start) · [Generated examples](EXAMPLES.md) · [Commands](#commands) · [Subscriptions](#subscription-access) · [Compatibility](#compatibility) · [Contributing](AGENTS.md)
 
 </div>
 
@@ -122,6 +122,9 @@ Model IDs are provider-specific. Credenvoy requires your choice rather than gues
 |---|---|
 | `task init` | Create a starter `profiles.json`, without overwriting it |
 | `task example` | Print an example selected by `AGENTCFG_EXAMPLE` |
+| `task examples` | Print the generated synthetic credential walkthrough |
+| `task examples:write` | Regenerate `EXAMPLES.md` |
+| `task examples:check` | Check the walkthrough for drift |
 | `task matrix` | Print every provider/auth/CLI route as JSON |
 | `task matrix:markdown` | Print the same matrix as a readable Markdown table |
 | `task validate` | Validate selected inputs without writing configuration |
@@ -152,6 +155,18 @@ Profiles may specify `model` directly, or `model_env`. Without either, the compi
 API-key source precedence is explicit `key_env`, then `AGENTCFG_<AGENT>_<PROVIDER>_API_KEY`, then the provider's conventional variables. Conflicting nonempty aliases fail. Secrets are read in Python; they are never inserted into shell command templates.
 
 `.env` files are **not loaded automatically**. Export values yourself or use your secret manager's environment-injection command.
+
+## Generated examples
+
+See [EXAMPLES.md](EXAMPLES.md) for synthetic source credentials, selected profiles, generated files, and runtime destinations—including Codex subscription auth, legacy OpenCode V1/V2 conversion, native V2 token sharing, Pi API-key references, and Copilot bootstrap.
+
+```sh
+task examples          # print the walkthrough
+task examples:write    # refresh EXAMPLES.md
+task examples:check    # detect documentation drift
+```
+
+The walkthrough is rendered with inherited environment values blocked. It does not read live login caches or install credentials. V1’s normal `~/.local/share/opencode/auth.json` path is shown alongside Credenvoy’s isolated state; V2 examples use a credential import and SQLite.
 
 ## Subscription access
 

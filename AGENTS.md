@@ -9,6 +9,7 @@ Credenvoy is a self-contained collection of go-task Taskfiles that runs a Python
 - `tasks/catalog.yml`: versioned provider registry, known env names, and examples. Keep provider IDs, protocols, auth modes, aliases, and source links explicit.
 - `tasks/tests.yml`: readable Python test blocks. Tests execute in the same in-memory module namespace as the runtime.
 - `README.md`: user guide and honest support claims.
+- `EXAMPLES.md`: generated Markdown walkthrough; refresh with `task examples:write`, check with `task examples:check`. Synthetic inputs stay embedded in `CATALOG_SHOWCASE`; no native credential files are committed.
 - `.github/workflows/`: credential-free validation and portable source-bundle creation.
 
 There is intentionally no `src/` package, external JSON registry, fixture directory, generated matrix checked into Git, or runtime pip dependency.
@@ -24,6 +25,8 @@ task lint              # embedded runtime syntax and registry invariants
 task matrix            # machine-readable current routes
 task matrix:markdown   # human-readable current routes
 task smoke             # offline local configuration generation
+task examples:write    # refresh documentation after output/fixture changes
+task examples:check    # check generated Markdown against the current compiler
 ```
 
 Use `PYTHON=python3` when needed. Validate from a temporary copy containing only `Taskfile.yml` and `tasks/` after changes that affect paths, imports, examples, or bootstrap. CI performs this check on Linux, macOS and Windows. No provider login is required for routine development.
@@ -36,6 +39,8 @@ Use `PYTHON=python3` when needed. Validate from a temporary copy containing only
 4. The dispatcher injects public catalog data into module globals. It does not inject credential values into Python source. Secrets are resolved from the process environment by the running compiler.
 5. Preserve UTF-8 output and platform-correct paths. Check Unix mode assertions only on Unix; do not imply that chmod sets Windows ACLs.
 6. Keep public error text free of credential values. Catch failures without echoing raw input JSON, subprocess output, or environment dumps.
+
+`EXAMPLES.md` is an explicit documentation exception to the generated-auth-file exclusion: it contains only synthetic values in Markdown code blocks. `task check` must still work without this document in a portable Taskfile-only copy.
 
 If you temporarily extract code for formatting, keep extraction output outside the tracked project and re-embed it before delivery. `task export` is an optional user-facing standalone-engine export, not a second source of truth.
 

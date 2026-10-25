@@ -210,7 +210,7 @@ vars:
     from unittest.mock import patch
 
     import tomllib
-    from credenvoy.runtime import EXAMPLES, engine_program
+    from credenvoy.runtime import EXAMPLES, SHOWCASE, engine_program, generated_examples
 
     from credenvoy import compiler as c
     from credenvoy import renderer as render
@@ -527,6 +527,91 @@ vars:
                             },
                         }
                     )
+
+        def test_generated_examples_ignore_ambient_credentials_and_restore_environment(
+            self,
+        ):
+            expected = generated_examples()
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENAI_API_KEY": "DO_NOT_LEAK",
+                    "GROQ_API_KEY": "DO_NOT_LEAK",
+                    "AGENT_CONFIG_SPEC": "DO_NOT_LEAK",
+                },
+            ):
+                self.assertEqual(generated_examples(), expected)
+                self.assertEqual(os.environ["OPENAI_API_KEY"], "DO_NOT_LEAK")
+            self.assertNotIn("DO_NOT_LEAK", expected)
+
+        def test_generated_examples_have_valid_json_and_toml_blocks(self):
+            import re
+
+            document = generated_examples()
+            blocks = re.findall(r"```(json|toml)\n(.*?)\n```", document, re.DOTALL)
+            self.assertGreater(len(blocks), 12)
+            for language, text in blocks:
+                if language == "json":
+                    json.loads(text)
+                else:
+                    tomllib.loads(text)
+            self.assertIn("~/.local/share/opencode/auth.json", document)
+            self.assertIn("state/opencode/opencode.db", document)
+            self.assertIn("chatgpt-token-sharing", document)
+
+        def test_generated_examples_never_stage_or_launch(self):
+            with (
+                patch(
+                    "credenvoy.renderer.stage",
+                    side_effect=AssertionError("must not write credentials"),
+                ),
+                patch(
+                    "credenvoy.launcher.bootstrap",
+                    side_effect=AssertionError("must not bootstrap credentials"),
+                ),
+            ):
+                self.assertIn("SYNTHETIC_REFRESH_TOKEN", generated_examples())
+
+        def test_generated_examples_document_legacy_mapping_and_pi_reference(self):
+            outputs = {}
+            for sample in SHOWCASE:
+                with patch.dict(os.environ, sample["environment"], clear=True):
+                    outputs[sample["profile"]["name"]] = render.render(
+                        c.compile_profile(sample["profile"])
+                    )
+            v1 = outputs["opencode-v1-codex-legacy"]["auth.json"]["openai"]
+            self.assertEqual(v1["accountId"], "SYNTHETIC_ACCOUNT_ID")
+            v2 = outputs["opencode-v2-codex-legacy"]["credentials.import.json"][0]["value"]
+            self.assertEqual(v2["metadata"]["accountID"], "SYNTHETIC_ACCOUNT_ID")
+            self.assertEqual(v2["methodID"], "chatgpt-headless")
+            self.assertEqual(
+                outputs["pi-groq"]["auth.json"]["groq"]["key"], "${GROQ_API_KEY}"
+            )
+
+        def test_generated_examples_standalone_drift_check(self):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cli = root / "credenvoy.py"
+                cli.write_text(engine_program(), encoding="utf-8")
+                command = [sys.executable, str(cli)]
+                missing = subprocess.run(
+                    command + ["examples:check"], cwd=root, capture_output=True, text=True
+                )
+                self.assertNotEqual(missing.returncode, 0)
+                subprocess.run(
+                    command + ["examples:write"], cwd=root, capture_output=True, check=True
+                )
+                subprocess.run(
+                    command + ["examples:check"], cwd=root, capture_output=True, check=True
+                )
+                (root / "EXAMPLES.md").write_text(
+                    "stale synthetic walkthrough", encoding="utf-8"
+                )
+                stale = subprocess.run(
+                    command + ["examples:check"], cwd=root, capture_output=True, text=True
+                )
+                self.assertNotEqual(stale.returncode, 0)
+                self.assertIn("Run task examples:write", stale.stderr)
 
         def test_sample_plan_and_generation_end_to_end(self):
             env = dict(os.environ)
