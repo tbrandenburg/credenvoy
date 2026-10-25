@@ -66,6 +66,20 @@ tasks:
     - task: catalog:_dispatch
       vars:
         ACTION: generate
+  install:
+    desc: Authenticate selected CLIs in their normal user locations, with backups
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: install
+  install:plan:
+    desc: Preview native installation destinations without writes or CLI commands
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: install:plan
   run:
     desc: Launch AGENTCFG_PROFILE with isolated agent state
     silent: true
@@ -127,3 +141,4 @@ tasks:
     - task: catalog:_dispatch
       vars:
         ACTION: examples:check
+

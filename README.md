@@ -19,14 +19,15 @@
 
 Claude Code wants one shape. OpenCode wants another. Pi, Codex, and Copilot have their own rules—and an API key is a different credential from a subscription login.
 
-**Credenvoy turns explicit profiles and environment variables into the configuration each CLI expects.** Review the plan, generate a private directory, then launch that profile with its own agent state.
+**Credenvoy turns explicit profiles and environment variables into the configuration each CLI expects.** Run `task install` once, then launch your agent CLIs normally. Credentials go to their native user locations; private generation and isolated launching are also available.
 
 Everything that runs Credenvoy lives in **four Taskfiles**. No Python package to install, registry to download, or hidden network bootstrap.
 
 - **Six adapters:** Claude Code, OpenCode V1, OpenCode V2, Pi, Codex, and GitHub Copilot CLI.
 - **44 provider/service profiles:** API keys, cloud identity, subscription bundles, and local models.
 - **288 explicit routes:** every configured combination gets a generation route, a gateway requirement, or a clear rejection.
-- **Review before use:** `plan` validates inputs without writing files or printing credential values.
+- **One-call native setup:** `install` compiles your selected profiles directly into normal CLI homes, with private backups and merging.
+- **Review before use:** `install:plan` previews native destinations without writes, CLI commands, or credential values; `plan` previews isolated generation.
 - **Keep sessions separate:** the launcher isolates agent state and preserves credentials refreshed after bootstrap.
 
 ## Quick start
@@ -40,7 +41,59 @@ task check
 
 If your Python executable is named `python3`, use `task check PYTHON=python3`. The same override works with other commands.
 
-### Try generation without an API key
+### Authenticate your CLIs in one call
+
+Define the CLI/provider combinations in `profiles.json` (see [profile examples](#a-profile-is-deliberately-small)), then supply their credentials through your existing environment or secret manager:
+
+```sh
+task install:plan       # optional preview of the real destinations
+task install            # compiles and installs all selected profiles
+
+# Launch normally, from any directory. No Credenvoy launcher is needed.
+codex
+opencode
+pi
+claude
+copilot
+```
+
+Only launch the CLIs you selected in your profiles. `install` reads the specification and environment directly: **no `task generate`, generated directory, shell sourcing, or profile wrapper is required.** To install one profile from a larger specification:
+
+```sh
+AGENTCFG_PROFILE=codex-chatgpt task install
+```
+
+Stop running CLI sessions before installation. Installing is an explicit credential replacement operation; the CLIs can refresh the installed credentials afterward. Re-running installation with a stale OAuth bundle can replace newer tokens. Routine CLI launches never reinstall snapshots.
+
+| Adapter | Native installation target / operation |
+|---|---|
+| OpenCode V1 | `~/.local/share/opencode/auth.json`; merge config into `~/.config/opencode/opencode.json` or an existing `opencode.jsonc` |
+| OpenCode V2 | Native `opencode auth import --standalone` into the normal local database; custom-provider config in the normal OpenCode config directory |
+| Codex | `~/.codex/auth.json` and `~/.codex/config.toml` |
+| Pi | `~/.pi/agent/auth.json`, `settings.json`, and `models.json`, as applicable |
+| Claude Code | `~/.claude/settings.json` and a supplied native `.credentials.json` bundle |
+| GitHub Copilot | Native `copilot login --with-token` via stdin; the CLI chooses its credential store. Model preference in `~/.copilot/settings.json` |
+
+Existing `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `COPILOT_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG`, and `OPENCODE_DB` overrides are honored. Overrides must be absolute; installer targets containing symlinks are rejected. Point an override at the physical directory if you manage dotfiles through symlinks. File-only routes can be configured before installing the CLI; native command routes require the corresponding CLI and flags. An installed OpenCode binary must match the selected major version; V1 and V2 cannot be mixed in one native installation.
+
+**Merging and backups.** Unrelated provider credentials and settings survive. Selected provider credentials are replaced as complete entries, so old OAuth fields cannot contaminate API-key credentials. Codex has one native identity file, so its supplied auth bundle replaces that file as a whole. A changed existing file gets an exact private sibling backup named `<filename>.credenvoy-backup-<unique-id>`. Existing OpenCode V2 databases get a SQLite snapshot that includes committed WAL data. No-op file installations create no extra backups. New directories use mode `0700` and files/backups `0600` on Unix; these modes do not establish Windows ACLs.
+
+JSONC comments and trailing commas are accepted. Modified configuration is serialized as JSON/TOML: **values are preserved, comments and layout are normalized**. Exact originals remain in backups. When several profiles configure one CLI, providers accumulate and the last profile's model/default wins; conflicting profiles for the same CLI/provider fail before writes. Use `AGENTCFG_PROFILE` to select a single account/default.
+
+**Installation boundaries.** The compatibility matrix describes generation routes, not universal native installation. `install` prevalidates the complete selection and rejects routes whose persistent native mapping is not implemented:
+
+- Copilot BYOK currently uses the isolated `task run` route. Although current Copilot documents `providers.json`, this installer does not guess its provider/model schema.
+- Codex and OpenCode routes requiring extra cloud/environment variables currently require `task run` (or separately maintained ambient cloud setup). Pi can persist provider-scoped environment values in its native API-key credential; Claude stores them in `settings.json.env`. External ADC files, AWS profiles and identity refresh remain external dependencies.
+- OpenCode V2 import is additive. The installer checks an existing database through native auth export and rejects a different credential or active selection for the same integration. Use OpenCode's auth commands to remove/select that credential before reinstalling; the installer does not mutate database tables directly. V2 model choice remains the CLI's own selection/`--model` behavior.
+- Claude's native file bundle does not provision an OS keychain. Existing keychain credentials or higher-priority shell/project/managed settings can override installed files. API keys written to Claude settings follow its API billing behavior.
+
+Installation resolves Pi API keys and Codex custom-provider bearer/header credentials into private native files so those routes work after the original environment variables are unset. Pi credential data is escaped to prevent it from being interpreted as a command or environment template. Installing does not mint subscriptions, validate model entitlements, or test provider inference.
+
+All file plans and native command capabilities are checked before file writes. Unexpected failures roll back Credenvoy's own file replacements when they still match what it wrote. Native login/import may have external effects (including keychains) that cannot be rolled back as one transaction. Backups remain beside their targets for recovery. Keep them private and remove them after verifying the new setup.
+
+Native references: [Copilot token login](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference), [Copilot configuration](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), [Pi providers](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/providers.md), [Codex configuration](https://developers.openai.com/codex/config-reference/), [examined OpenCode V2 importer](https://github.com/anomalyco/opencode/blob/b6cbbd7646ec7a05945db3e7f499c9ae5af0b3d1/packages/cli/src/commands/handlers/auth/import.ts).
+
+### Try isolated generation without an API key
 
 ```sh
 # Creates a local-model profile; refuses to overwrite an existing profiles.json.
@@ -129,6 +182,8 @@ Model IDs are provider-specific. Credenvoy requires your choice rather than gues
 | `task matrix:markdown` | Print the same matrix as a readable Markdown table |
 | `task validate` | Validate selected inputs without writing configuration |
 | `task plan` | Validate and list the native files that will be generated |
+| `task install:plan` | Preview native installation destinations without changing CLI state |
+| `task install` | Install selected credentials and configuration in normal CLI locations |
 | `task generate` | Generate all selected profiles into a new private directory |
 | `task run` | Launch `AGENTCFG_PROFILE` with its generated configuration |
 | `task lint` | Check embedded runtime syntax and catalog invariants |
@@ -158,7 +213,7 @@ API-key source precedence is explicit `key_env`, then `AGENTCFG_<AGENT>_<PROVIDE
 
 ## Generated examples
 
-See [EXAMPLES.md](EXAMPLES.md) for synthetic source credentials, selected profiles, generated files, and runtime destinations—including Codex subscription auth, legacy OpenCode V1/V2 conversion, native V2 token sharing, Pi API-key references, and Copilot bootstrap.
+The paths in [EXAMPLES.md](EXAMPLES.md) describe isolated `generate`/`run` output; `task install` writes directly to the native locations listed above. See that walkthrough for synthetic source credentials, selected profiles, generated files, and runtime destinations—including Codex subscription auth, legacy OpenCode V1/V2 conversion, native V2 token sharing, Pi API-key references, and Copilot bootstrap.
 
 ```sh
 task examples          # print the walkthrough
@@ -277,7 +332,7 @@ Read [AGENTS.md](AGENTS.md), then run:
 task check
 ```
 
-The embedded tests cover all 288 matrix cells, subscription preservation, legacy conversion, serialization, aliases, cloud credential groups, no-overwrite behavior, isolated runtime selection, bootstrap/import capability checks, and a real plan/generate subprocess round trip using synthetic credentials.
+The embedded tests cover all 288 matrix cells, subscription preservation, legacy conversion, serialization, aliases, cloud credential groups, no-overwrite behavior, isolated runtime selection, bootstrap/import capability checks, native installation, merging, backups, rollback, JSONC/TOML preservation, and a real plan/generate subprocess round trip using synthetic credentials.
 
 GitHub CI is configured for Python 3.11–3.14 on Linux, with additional macOS and Windows jobs. It copies only the Taskfiles into a temporary directory before running checks, so accidental dependencies on other repository files fail early. CI requires no provider credentials and makes no live inference or OAuth requests.
 
@@ -290,3 +345,4 @@ The suite is a configuration generator with synthetic validation. Live provider 
 ## License
 
 [MIT](LICENSE). Upstream provider-data attribution is recorded in [NOTICE](NOTICE).
+

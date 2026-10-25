@@ -5,7 +5,7 @@ Credenvoy is a self-contained collection of go-task Taskfiles that runs a Python
 ## Repository map
 
 - `Taskfile.yml`: public command names and orchestration. Keep it small.
-- `tasks/runtime.yml`: readable Python literal blocks named `RENDERER_SOURCE`, `COMPILER_SOURCE`, `LAUNCHER_SOURCE`, and `BOOTSTRAP_SOURCE`. The private `_dispatch` task assembles modules in memory.
+- `tasks/runtime.yml`: readable Python literal blocks named `RENDERER_SOURCE`, `COMPILER_SOURCE`, `LAUNCHER_SOURCE`, `INSTALLER_SOURCE`, and `BOOTSTRAP_SOURCE`. The private `_dispatch` task assembles modules in memory.
 - `tasks/catalog.yml`: versioned provider registry, known env names, and examples. Keep provider IDs, protocols, auth modes, aliases, and source links explicit.
 - `tasks/tests.yml`: readable Python test blocks. Tests execute in the same in-memory module namespace as the runtime.
 - `README.md`: user guide and honest support claims.
@@ -19,6 +19,7 @@ There is intentionally no `src/` package, external JSON registry, fixture direct
 Requires Python 3.11+ and Task 3.54+:
 
 ```sh
+task install:plan      # preview native user paths; implementation work must use synthetic homes
 task check             # syntax/invariants, all tests, offline generation smoke
 task test              # focused test suite
 task lint              # embedded runtime syntax and registry invariants
@@ -35,7 +36,7 @@ Use `PYTHON=python3` when needed. Validate from a temporary copy containing only
 
 1. Read the relevant YAML literal block before changing it. Maintain YAML indentation and standard Python formatting; do not minify the code or hide it in base64.
 2. Keep the runtime Python-only and standard-library-only. Tests must not import a local package or read a companion fixture from the repository.
-3. `RENDERER_SOURCE` owns JSON/TOML serialization and private staging. `COMPILER_SOURCE` owns profile validation and route selection. `LAUNCHER_SOURCE` owns environment isolation and bootstrap. `BOOTSTRAP_SOURCE` owns module assembly and command dispatch.
+3. `RENDERER_SOURCE` owns JSON/TOML serialization and private staging. `COMPILER_SOURCE` owns profile validation and route selection. `LAUNCHER_SOURCE` owns environment isolation and bootstrap. `INSTALLER_SOURCE` owns explicit native installation, destination resolution, merge/replace rules, backups and command-based login/import. `BOOTSTRAP_SOURCE` owns module assembly and command dispatch.
 4. The dispatcher injects public catalog data into module globals. It does not inject credential values into Python source. Secrets are resolved from the process environment by the running compiler.
 5. Preserve UTF-8 output and platform-correct paths. Check Unix mode assertions only on Unix; do not imply that chmod sets Windows ACLs.
 6. Keep public error text free of credential values. Catch failures without echoing raw input JSON, subprocess output, or environment dumps.
@@ -59,6 +60,7 @@ If you temporarily extract code for formatting, keep extraction output outside t
 - Never commit `.env`, `profiles.json`, generated auth/config files, exports, logs, or live credentials. Keep `.gitignore` aligned with new output paths.
 - API keys, upstream OAuth credentials, inference session tokens, bearer tokens, and native auth bundles are separate types. Do not silently replace a subscription route with API billing.
 - Native bundles preserve unknown fields. Token translation must preserve known issuer/client provenance, method, account metadata, and genuine expiry; it cannot create scopes or change token authority.
+- Installation is explicitly authorized to replace selected native credentials. Test it only against temporary homes and mocked native commands; never invoke install against the developer home during implementation. Preserve unrelated providers/settings, back up originals privately, suppress third-party output, and fail before writes on unsupported persistent mappings.
 - Do not overwrite refreshed credentials during routine launches. Bootstrap is distinct from rotation and cross-machine synchronization.
 - Keep new output directories private, refuse overwrites, and avoid shared servers/databases during bootstrap. Atomic writes alone do not coordinate with an external CLI's token refresh lock.
 - Preserve launch-time credential/provider-selector cleanup and explicit endpoint selection. Never interpolate secret values into Taskfile command text.
@@ -74,3 +76,4 @@ If you temporarily extract code for formatting, keep extraction output outside t
 ## Completion checklist
 
 Run the relevant checks once after the final code change. Report what changed, which checks actually ran, and any remaining limitations. Separate synthetic configuration coverage from live authentication, model entitlement, billing, or platform-isolation guarantees. Keep the final repository free of superseded reports, prototype modules, cache directories, and generated outputs.
+

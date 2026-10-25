@@ -26,3 +26,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+
+# Private native installation recovery copies
+*.credenvoy-backup-*

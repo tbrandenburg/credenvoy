@@ -1269,6 +1269,568 @@ vars:
 
     if __name__ == "__main__":
         main()
+  INSTALLER_SOURCE: |
+    """Install compiled profiles into the user locations read by ordinary CLI launches."""
+
+    import argparse
+    import copy
+    import datetime
+    import json
+    import os
+    import re
+    import shutil
+    import sqlite3
+    import subprocess
+    import tempfile
+    import tomllib
+    import uuid
+    from contextlib import closing
+    from pathlib import Path
+
+    from credenvoy import compiler, launcher, renderer
+
+
+    class InstallError(ValueError):
+        """Public, credential-free installation diagnostic."""
+
+
+    def location(variable, fallback):
+        try:
+            value = os.environ.get(variable)
+            if not value:
+                value = fallback() if callable(fallback) else fallback
+            path = Path(value).expanduser()
+        except RuntimeError:
+            raise InstallError(
+                "Cannot determine user home; set an explicit CLI home/config override"
+            ) from None
+        if not path.is_absolute():
+            raise InstallError("CLI home/config overrides must be absolute paths")
+        return path
+
+
+    def destinations(agent):
+        if agent.startswith("opencode"):
+            data = (
+                location("XDG_DATA_HOME", lambda: Path.home() / ".local/share") / "opencode"
+            )
+
+            def default_config():
+                config = (
+                    location("XDG_CONFIG_HOME", lambda: Path.home() / ".config")
+                    / "opencode"
+                )
+                return config / (
+                    "opencode.jsonc"
+                    if (config / "opencode.jsonc").exists()
+                    else "opencode.json"
+                )
+
+            return data, location("OPENCODE_CONFIG", default_config)
+        variable, relative = {
+            "claude": ("CLAUDE_CONFIG_DIR", ".claude"),
+            "codex": ("CODEX_HOME", ".codex"),
+            "pi": ("PI_CODING_AGENT_DIR", ".pi/agent"),
+            "copilot": ("COPILOT_HOME", ".copilot"),
+        }[agent]
+        return location(variable, lambda: Path.home() / relative), None
+
+
+    def safe_path(path):
+        # Do not silently replace dotfile symlinks, traverse linked directories or
+        # read device files. This is a local-user safeguard, not a race-proof sandbox.
+        for part in (path, *path.parents):
+            if part.is_symlink():
+                raise InstallError(
+                    "Install target contains a symlink; use a physical CLI home override"
+                )
+        if path.exists() and not path.is_file():
+            raise InstallError("Install target must be a regular file")
+
+
+    def json_object(text):
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise InstallError("Duplicate JSON keys in existing configuration")
+                result[key] = value
+            return result
+
+        # Strings are matched first so comment markers and commas inside them survive.
+        pattern = r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?\*/|,\s*(?=[}\]])'
+        clean = re.sub(pattern, lambda m: m[0] if m[0].startswith('"') else " ", text)
+        result = json.loads(clean.lstrip("\ufeff"), object_pairs_hook=pairs)
+        if not isinstance(result, dict):
+            raise InstallError("Existing configuration must contain a JSON object")
+        return result
+
+
+    def merge(old, new):
+        result = copy.deepcopy(old)
+        for key, value in new.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = merge(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+
+    def toml_value(value):
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return repr(value)
+        if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+            return value.isoformat()
+        if isinstance(value, list):
+            return "[" + ", ".join(toml_value(item) for item in value) + "]"
+        if isinstance(value, dict):
+            return (
+                "{ "
+                + ", ".join(toml_value(k) + " = " + toml_value(v) for k, v in value.items())
+                + " }"
+            )
+        raise InstallError("Unsupported existing TOML value")
+
+
+    def serialize(value, toml=False):
+        if toml:
+            text = "".join(
+                toml_value(k) + " = " + toml_value(v) + "\n" for k, v in value.items()
+            )
+            tomllib.loads(text)
+            return text.encode("utf-8")
+        return (
+            json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        ).encode("utf-8")
+
+
+    def pi_literal(value):
+        # Pi interprets ! as a command and $ as interpolation. Escape credential data.
+        value = value.replace("$", "$$")
+        return "$!" + value[1:] if value.startswith("!") else value
+
+
+    class Installation:
+        def __init__(self):
+            self.files = {}
+            self.commands = []
+            self.slots = {}
+            self.adapters = set()
+
+        def update(self, path, values, replace_keys=(), remove_keys=(), whole=False):
+            safe_path(path)
+            if path not in self.files:
+                original = path.read_bytes() if path.exists() else None
+                try:
+                    parsed = (
+                        (
+                            tomllib.loads(original.decode("utf-8"))
+                            if path.suffix == ".toml"
+                            else json_object(original.decode("utf-8"))
+                        )
+                        if original is not None
+                        else {}
+                    )
+                except (ValueError, UnicodeError):
+                    raise InstallError(
+                        "Existing target is invalid JSON/JSONC/TOML; repair it before installation"
+                    ) from None
+                self.files[path] = {"before": original, "value": parsed}
+            entry = self.files[path]
+            old = {} if whole else copy.deepcopy(entry["value"])
+            for key in (*replace_keys, *remove_keys):
+                old.pop(key, None)
+            entry["value"] = merge(old, values)
+            entry["after"] = serialize(entry["value"], path.suffix == ".toml")
+
+        def add(self, profile):
+            agent, provider = profile["agent"], profile["provider"]
+            opposite = {"opencode-v1": "opencode-v2", "opencode-v2": "opencode-v1"}.get(
+                agent
+            )
+            if opposite in self.adapters:
+                raise InstallError("Choose one OpenCode major version per installation")
+            self.adapters.add(agent)
+            data, config = destinations(agent)
+            files = renderer.render(profile)
+            runtime = files.pop("runtime.json")
+            values = {
+                **runtime["values"],
+                **{k: renderer.env(v) for k, v in runtime["references"].items()},
+            }
+            slot = (agent.replace("opencode-v2", "opencode-v1"), provider)
+            signature = json.dumps(files, sort_keys=True) + json.dumps(
+                values, sort_keys=True
+            )
+            if slot in self.slots and self.slots[slot] != signature:
+                raise InstallError(
+                    "Conflicting profiles target the same CLI/provider; select one with AGENTCFG_PROFILE"
+                )
+            self.slots[slot] = signature
+            if agent == "pi":
+                auth = files.pop("auth.json", {})
+                entry = auth.get(provider)
+                if entry and entry["type"] == "api_key" and profile.get("api_key_env"):
+                    entry["key"] = pi_literal(renderer.env(profile["api_key_env"]))
+                if values:
+                    if entry is None:
+                        entry = auth[provider] = {"type": "api_key"}
+                    if entry["type"] != "api_key":
+                        raise InstallError(
+                            "Pi OAuth plus extra environment needs isolated task run"
+                        )
+                    entry["env"] = {**entry.get("env", {}), **values}
+                if auth:
+                    self.update(data / "auth.json", auth, replace_keys=auth)
+            elif agent == "codex":
+                parsed = tomllib.loads(files.pop("config.toml"))
+                # The ordinary launch must not depend on this installer's shell env.
+                custom = parsed.get("model_providers", {}).get("generated")
+                consumed = set()
+                if custom is not None:
+                    if "env_key" in custom:
+                        name = custom.pop("env_key")
+                        custom["experimental_bearer_token"] = renderer.env(name)
+                        consumed.add(name)
+                    if "env_http_headers" in custom:
+                        headers = custom.pop("env_http_headers")
+                        custom["http_headers"] = {
+                            k: renderer.env(v) for k, v in headers.items()
+                        }
+                        consumed.update(headers.values())
+                    name = "credenvoy_" + profile["name"]
+                    parsed["model_providers"] = {name: custom}
+                    parsed["model_provider"] = name
+                else:
+                    parsed.setdefault("model_provider", "openai")
+                if set(values) - consumed - {profile.get("api_key_env")}:
+                    raise InstallError(
+                        "Codex cloud/environment-only configuration needs isolated task run"
+                    )
+                if "auth.json" in files:
+                    self.update(data / "auth.json", files.pop("auth.json"), whole=True)
+                    parsed["forced_login_method"] = (
+                        "api" if profile.get("native_api_key") else "chatgpt"
+                    )
+                # Clear a previous configured default profile which would mask this selection.
+                self.update(
+                    data / "config.toml",
+                    parsed,
+                    remove_keys=(
+                        "profile",
+                        "forced_login_method",
+                        "openai_base_url",
+                        "chatgpt_base_url",
+                    ),
+                )
+                if custom is not None:
+                    # Replace this managed provider atomically, excluding stale env/auth fields.
+                    current = self.files[data / "config.toml"]["value"]
+                    current["model_providers"][name] = custom
+                    self.files[data / "config.toml"]["after"] = serialize(current, True)
+            elif agent == "claude":
+                settings = data / "settings.json"
+                self.update(settings, {})
+                current = self.files[settings]["value"]
+                current.pop("apiKeyHelper", None)
+                old_env = current.get("env", {})
+                if not isinstance(old_env, dict):
+                    raise InstallError("Claude settings.env must be an object")
+                for key in list(old_env):
+                    if key in launcher.RESET and (
+                        key.startswith("ANTHROPIC_") or key.startswith("CLAUDE_CODE_USE_")
+                    ):
+                        old_env.pop(key)
+                for filename, value in files.items():
+                    self.update(
+                        data / filename,
+                        value,
+                        replace_keys=value if filename == ".credentials.json" else (),
+                    )
+                return
+            elif agent == "copilot":
+                token = values.pop("COPILOT_GITHUB_TOKEN", None)
+                model = values.pop("COPILOT_MODEL", None)
+                if values:
+                    raise InstallError(
+                        "Copilot BYOK currently needs task run; native providers.json installation is not yet implemented"
+                    )
+                if model:
+                    self.update(data / "settings.json", {"model": model})
+                if token:
+                    self.commands.append(
+                        {
+                            "adapter": agent,
+                            "input": token + "\n",
+                            "target": data / "config.json",
+                        }
+                    )
+            elif agent.startswith("opencode"):
+                # Key references in V2's custom-provider declaration become static settings.
+                if (
+                    agent == "opencode-v2"
+                    and "opencode.json" in files
+                    and profile.get("api_key_env")
+                ):
+                    entry = files["opencode.json"]["providers"][provider]
+                    entry.pop("env", None)
+                if set(values) - {profile.get("api_key_env")}:
+                    raise InstallError(
+                        "OpenCode cloud/environment-only configuration needs isolated task run"
+                    )
+                if "auth.json" in files:
+                    auth = files.pop("auth.json")
+                    self.update(data / "auth.json", auth, replace_keys=auth)
+                if "credentials.import.json" in files:
+                    self.commands.append(
+                        {
+                            "adapter": agent,
+                            "input": json.dumps(files.pop("credentials.import.json")),
+                            "target": location("OPENCODE_DB", data / "opencode.db"),
+                        }
+                    )
+                if "opencode.json" in files:
+                    self.update(config, files.pop("opencode.json"))
+            for filename, value in files.items():
+                if agent in ("pi", "codex"):
+                    self.update(data / filename, value)
+
+        def describe(self):
+            for path, entry in self.files.items():
+                print(
+                    (
+                        "Unchanged: "
+                        if entry["before"] == entry["after"]
+                        else "Merge/install: "
+                    )
+                    + str(path)
+                )
+            for command in self.commands:
+                print(
+                    (
+                        "Native Copilot login: "
+                        if command["adapter"] == "copilot"
+                        else "Additive OpenCode V2 import: "
+                    )
+                    + str(command["target"])
+                )
+            print("Plan only. No files written or CLI commands executed.")
+
+
+    def private_write(path, content):
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary = tempfile.mkstemp(prefix=".credenvoy-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+    def native_command(command, env, preflight=False):
+        if command["adapter"] == "copilot":
+            argv = (
+                ["copilot", "login", "--help"]
+                if preflight
+                else ["copilot", "login", "--with-token"]
+            )
+            required = "--with-token"
+        else:
+            argv = (
+                ["opencode", "auth", "import", "--help"]
+                if preflight
+                else ["opencode", "auth", "import", "--standalone"]
+            )
+            required = "--standalone"
+        result = subprocess.run(
+            argv,
+            input=None if preflight else command["input"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+        if preflight and required not in result.stdout + result.stderr:
+            raise InstallError(
+                "Installed CLI lacks the required noninteractive authentication command"
+            )
+
+
+    def apply(plan):
+        # Capability checks happen before any native files change. Suppress third-party
+        # output/exceptions because they can echo credential data.
+        env = dict(os.environ)
+        if "opencode-v1" in plan.adapters and shutil.which("opencode"):
+            launcher.check_version("opencode-v1", "opencode", env)
+        for command in plan.commands:
+            native_command(command, env, preflight=True)
+            safe_path(command["target"])
+        for command in plan.commands:
+            if command["adapter"] == "opencode-v2":
+                launcher.check_version("opencode-v2", "opencode", env)
+                if command["target"].exists():
+                    result = subprocess.run(
+                        ["opencode", "auth", "export", "--standalone"],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=120,
+                    )
+                    existing = json.loads(result.stdout)
+                    if not isinstance(existing, list):
+                        raise InstallError("Unexpected OpenCode auth export format")
+                    for incoming in json.loads(command["input"]):
+                        matches = [
+                            entry
+                            for entry in existing
+                            if entry.get("id") == incoming["id"]
+                            or entry.get("integrationID") == incoming["integrationID"]
+                        ]
+                        if matches and not any(
+                            entry.get("id") == incoming["id"]
+                            and entry.get("integrationID") == incoming["integrationID"]
+                            and entry.get("value") == incoming["value"]
+                            and (not incoming["active"] or entry.get("active"))
+                            for entry in matches
+                        ):
+                            raise InstallError(
+                                "OpenCode V2 already has a different credential/selection; use its native auth commands to remove/select it before reinstalling"
+                            )
+        backups = []
+        changed = []
+        try:
+            # Detect changes since the plan before performing any writes.
+            for path, entry in plan.files.items():
+                safe_path(path)
+                if (path.read_bytes() if path.exists() else None) != entry["before"]:
+                    raise InstallError(
+                        "Target changed during planning; stop the CLI and retry"
+                    )
+            # All backup files are private and sit beside the file being changed.
+            for path, entry in plan.files.items():
+                if entry["before"] == entry["after"]:
+                    continue
+                if entry["before"] is not None:
+                    backup = path.with_name(
+                        path.name + ".credenvoy-backup-" + uuid.uuid4().hex
+                    )
+                    private_write(backup, entry["before"])
+                    backups.append(backup)
+            for command in plan.commands:
+                target = command["target"]
+                if target.exists():
+                    backup = target.with_name(
+                        target.name + ".credenvoy-backup-" + uuid.uuid4().hex
+                    )
+                    if command["adapter"] == "opencode-v2":
+                        private_write(backup, b"")
+                        # A SQLite transaction context does not close its connection.
+                        # Close both handles explicitly, including on backup failures.
+                        with closing(
+                            sqlite3.connect(target.as_uri() + "?mode=ro", uri=True)
+                        ) as source:
+                            with closing(sqlite3.connect(backup)) as destination:
+                                source.backup(destination)
+                    else:
+                        private_write(backup, target.read_bytes())
+                    backups.append(backup)
+            for path, entry in plan.files.items():
+                if entry["before"] != entry["after"]:
+                    # Recheck immediately before each replace; external refresh locks
+                    # cannot be coordinated portably. Users must stop running CLIs.
+                    safe_path(path)
+                    if (path.read_bytes() if path.exists() else None) != entry["before"]:
+                        raise InstallError(
+                            "Target changed during installation; stop the CLI and retry"
+                        )
+                    private_write(path, entry["after"])
+                    changed.append(path)
+            for command in plan.commands:
+                native_command(command, env)
+        except BaseException:
+            for path in reversed(changed):
+                entry = plan.files[path]
+                if path.read_bytes() == entry["after"]:
+                    if entry["before"] is None:
+                        path.unlink()
+                    else:
+                        private_write(path, entry["before"])
+            raise
+        for path in plan.files:
+            os.chmod(path, 0o600)
+        for path in changed:
+            print("Installed: " + str(path))
+        for path in backups:
+            print("Backup: " + str(path))
+        if any(c["adapter"] == "opencode-v2" for c in plan.commands):
+            print(
+                "OpenCode V2 import completed: additive only; existing IDs and active selections are preserved, not rotated."
+            )
+        if any(c["adapter"] == "copilot" for c in plan.commands):
+            print("Copilot native login completed; the CLI manages keychain/file storage.")
+        print(
+            "Installation completed. Launch your CLI normally; no generated directory is required."
+        )
+
+
+    def main(argv=None, dry_run=False):
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--spec", default=os.environ.get("AGENTCFG_SPEC", "profiles.json")
+        )
+        parser.add_argument("--profile", default=os.environ.get("AGENTCFG_PROFILE"))
+        args = parser.parse_args(argv)
+        try:
+            raw = compiler.load_spec(args.spec)
+            if args.profile:
+                raw = {
+                    **raw,
+                    "profiles": [
+                        p for p in raw["profiles"] if p.get("name") == args.profile
+                    ],
+                }
+                if not raw["profiles"]:
+                    raise InstallError("Selected AGENTCFG_PROFILE does not exist")
+            spec = compiler.compile_spec(raw)
+            plan = Installation()
+            for profile in spec["profiles"]:
+                plan.add(profile)
+            if not plan.files and not plan.commands:
+                raise InstallError(
+                    "Selected profiles have no persistent authentication/configuration to install"
+                )
+            if dry_run:
+                plan.describe()
+            else:
+                apply(plan)
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            OSError,
+            subprocess.SubprocessError,
+            sqlite3.Error,
+        ) as exc:
+            message = (
+                str(exc)
+                if isinstance(exc, InstallError)
+                else "Installation failed; check profile inputs and CLI capabilities. No credential values are shown."
+            )
+            parser.exit(
+                1,
+                message
+                + "\nNative command effects may require manual recovery; private backups remain beside changed files.\n",
+            )
   BOOTSTRAP_SOURCE: |
     import ast
     import json
@@ -1324,6 +1886,7 @@ vars:
         _PAYLOAD["sources"]["launcher"],
         {"CREDENVOY_ENV_NAMES": _PAYLOAD["env_names"]},
     )
+    installer = load_module("credenvoy.installer", _PAYLOAD["sources"]["installer"])
     runtime = types.ModuleType("credenvoy.runtime")
     runtime.EXAMPLES = EXAMPLES
     runtime.engine_program = engine_program
@@ -1365,6 +1928,13 @@ vars:
             "Run `task examples` to print this walkthrough, `task examples:write` to "
             "refresh it, and `task examples:check` to detect drift. "
             "CI checks this document separately from the portable Taskfile-only tests.",
+            "",
+            "These `generated/` paths describe optional isolated `task generate`/`task run` "
+            "sessions. For ordinary CLI launches, run `task install:plan` then `task install`: "
+            "the same profiles and source inputs are compiled directly into native user locations. "
+            "For example, OpenCode V1 receives `~/.local/share/opencode/auth.json`, Codex "
+            "receives `~/.codex/auth.json`, and Pi receives `~/.pi/agent/auth.json`. "
+            "See the README for overrides, supported installation routes and backups.",
             "",
             "Source inputs are shown decoded for readability. Object/array values "
             "must be JSON-serialized into their named environment variable in real use; "
@@ -1471,7 +2041,7 @@ vars:
         if not args or args[0] in ("help", "--help", "-h"):
             print(
                 "Credenvoy " + VERSION + " — your credentials, delivered to every agent.\n"
-                "Commands: matrix, matrix:markdown, example, examples, examples:write, examples:check, init, validate, plan, generate, run, lint, test, smoke, export\n"
+                "Commands: matrix, matrix:markdown, example, examples, examples:write, examples:check, init, validate, plan, generate, install:plan, install, run, lint, test, smoke, export\n"
                 "Selection: AGENTCFG_SPEC, AGENTCFG_OUTPUT, AGENTCFG_PROFILE, AGENTCFG_EXAMPLE"
             )
             return
@@ -1480,6 +2050,8 @@ vars:
             print("Credenvoy " + VERSION)
         elif action in ("matrix", "plan", "generate", "validate"):
             compiler.main(["plan" if action == "validate" else action, *tail])
+        elif action in ("install", "install:plan"):
+            installer.main(tail, dry_run=action == "install:plan")
         elif action == "run":
             launcher.main(tail)
         elif action == "matrix:markdown":
@@ -1553,12 +2125,14 @@ tasks:
               "renderer": {{.RENDERER_SOURCE | toJson}},
               "compiler": {{.COMPILER_SOURCE | toJson}},
               "launcher": {{.LAUNCHER_SOURCE | toJson}},
+              "installer": {{.INSTALLER_SOURCE | toJson}},
           },
           "tests": {
               {{if eq .ACTION "test"}}
               "test_renderer": {{.TEST_RENDERER | toJson}},
               "test_compiler": {{.TEST_COMPILER | toJson}},
               "test_launcher": {{.TEST_LAUNCHER | toJson}},
+              "test_installer": {{.TEST_INSTALLER | toJson}},
               {{end}}
           },
           "registry": json.loads({{.REGISTRY | toJson}}),
@@ -1569,3 +2143,4 @@ tasks:
       _BOOTSTRAP_SOURCE = {{.BOOTSTRAP_SOURCE | toJson}}
       exec(compile(_BOOTSTRAP_SOURCE, '<credenvoy.runtime>', 'exec'))
       CREDENVOY_PYTHON
+
