@@ -1,0 +1,693 @@
+version: '3'
+vars:
+  TEST_RENDERER: |
+    import json
+    import os
+    import stat
+    import tempfile
+    import unittest
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from credenvoy import renderer as render
+
+
+    class RenderTests(unittest.TestCase):
+        def setUp(self):
+            self.patch = patch.dict(
+                os.environ,
+                {
+                    "TEST_KEY": 'fake-"key\\with\nnewline',
+                    "GITHUB_COPILOT_OAUTH_TOKEN": "fake-gho-token",
+                    "TEST_OAUTH": json.dumps(
+                        {
+                            "type": "oauth",
+                            "refresh": "fake-refresh",
+                            "access": "fake-access",
+                            "expires": 1900000000000,
+                        }
+                    ),
+                    "TEST_PROJECT": "project-id",
+                },
+                clear=True,
+            )
+            self.patch.start()
+            self.addCleanup(self.patch.stop)
+
+        def profile(self, agent, **kw):
+            return dict(name="example", agent=agent, provider="anthropic", **kw)
+
+        def test_v1_api_json_roundtrip(self):
+            files = render.render(self.profile("opencode-v1", api_key_env="TEST_KEY"))
+            self.assertEqual(
+                json.loads(json.dumps(files["auth.json"]))["anthropic"]["key"],
+                os.environ["TEST_KEY"],
+            )
+            self.assertEqual(files["auth.json"]["anthropic"]["type"], "api")
+
+        def test_v1_copilot_bootstrap(self):
+            p = self.profile("opencode-v1", github_oauth_env="GITHUB_COPILOT_OAUTH_TOKEN")
+            p["provider"] = "github-copilot"
+            self.assertEqual(
+                render.render(p)["auth.json"]["github-copilot"],
+                {
+                    "type": "oauth",
+                    "refresh": "fake-gho-token",
+                    "access": "fake-gho-token",
+                    "expires": 0,
+                },
+            )
+
+        def test_v2_key_import(self):
+            files = render.render(
+                self.profile(
+                    "opencode-v2", api_key_env="TEST_KEY", credential_id="cred_example"
+                )
+            )
+            entry = files["credentials.import.json"][0]
+            self.assertEqual(entry["value"]["type"], "key")
+            self.assertNotIn("auth.json", files)
+
+        def test_v2_oauth_method_required(self):
+            with self.assertRaises(ValueError):
+                render.render(
+                    self.profile(
+                        "opencode-v2",
+                        oauth_json_env="TEST_OAUTH",
+                        credential_id="cred_example",
+                    )
+                )
+
+        def test_pi_runtime_reference(self):
+            files = render.render(
+                self.profile("pi", api_key_env="TEST_KEY", model="example-model")
+            )
+            self.assertEqual(files["auth.json"]["anthropic"]["key"], "${TEST_KEY}")
+            self.assertEqual(files["settings.json"]["defaultProvider"], "anthropic")
+
+        def test_pi_oauth(self):
+            auth = render.render(self.profile("pi", oauth_json_env="TEST_OAUTH"))[
+                "auth.json"
+            ]
+            self.assertEqual(auth["anthropic"]["expires"], 1900000000000)
+
+        def test_claude_settings(self):
+            files = render.render(self.profile("claude", api_key_env="TEST_KEY"))
+            self.assertEqual(
+                files["settings.json"]["env"]["ANTHROPIC_API_KEY"], os.environ["TEST_KEY"]
+            )
+
+        def test_claude_unsupported_provider(self):
+            p = self.profile("claude", api_key_env="TEST_KEY")
+            p["provider"] = "groq"
+            with self.assertRaises(ValueError):
+                render.render(p)
+
+        def test_codex_toml_parse_and_env_reference(self):
+            import tomllib
+
+            p = self.profile(
+                "codex",
+                api_key_env="TEST_KEY",
+                protocol="openai-responses",
+                base_url="https://example.invalid/v1",
+                model="test-model",
+            )
+            config = tomllib.loads(render.render(p)["config.toml"])
+            self.assertEqual(config["model_providers"]["generated"]["env_key"], "TEST_KEY")
+            self.assertNotIn(os.environ["TEST_KEY"], render.render(p)["config.toml"])
+
+        def test_codex_rejects_chat_only(self):
+            with self.assertRaises(ValueError):
+                render.render(
+                    self.profile(
+                        "codex",
+                        api_key_env="TEST_KEY",
+                        base_url="https://example.invalid/v1",
+                        protocol="openai-completions",
+                    )
+                )
+
+        def test_copilot_byok_runtime(self):
+            p = self.profile(
+                "copilot",
+                api_key_env="TEST_KEY",
+                base_url="https://example.invalid",
+                model="example",
+                protocol="anthropic-messages",
+            )
+            files = render.render(p)
+            self.assertNotIn("config.json", files)
+            self.assertEqual(
+                files["runtime.json"]["references"]["COPILOT_PROVIDER_API_KEY"], "TEST_KEY"
+            )
+
+        def test_invalid_oauth_expiry(self):
+            with patch.dict(
+                os.environ,
+                {
+                    "TEST_OAUTH": '{"type":"oauth","access":"a","refresh":"r","expires":true}'
+                },
+            ):
+                with self.assertRaises(ValueError):
+                    render.render(self.profile("pi", oauth_json_env="TEST_OAUTH"))
+
+        def test_native_auth_bundle_preserved(self):
+            value = {
+                "tokens": {"access_token": "fake", "refresh_token": "fake"},
+                "future_field": 1,
+            }
+            with patch.dict(os.environ, {"NATIVE_AUTH": json.dumps(value)}):
+                files = render.render(
+                    self.profile("codex", native_auth_json_env="NATIVE_AUTH")
+                )
+                self.assertEqual(files["auth.json"], value)
+
+        def test_staging_private_and_no_overwrite(self):
+            with tempfile.TemporaryDirectory() as folder:
+                output = Path(folder) / "generated"
+                render.stage(
+                    {"profiles": [self.profile("opencode-v1", api_key_env="TEST_KEY")]},
+                    output,
+                )
+                if os.name == "posix":
+                    self.assertEqual(
+                        stat.S_IMODE((output / "example/auth.json").stat().st_mode), 0o600
+                    )
+                    self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+                with self.assertRaises(ValueError):
+                    render.stage({"profiles": []}, output)
+
+        def test_validate_all_before_writing(self):
+            with tempfile.TemporaryDirectory() as folder:
+                output = Path(folder) / "generated"
+                spec = {
+                    "profiles": [
+                        self.profile("pi", api_key_env="TEST_KEY"),
+                        dict(
+                            name="bad",
+                            agent="pi",
+                            provider="anthropic",
+                            api_key_env="MISSING",
+                        ),
+                    ]
+                }
+                with self.assertRaises(ValueError):
+                    render.stage(spec, output)
+                self.assertFalse(output.exists())
+
+
+    if __name__ == "__main__":
+        unittest.main()
+  TEST_COMPILER: |
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import unittest
+    from pathlib import Path
+    from unittest.mock import patch
+
+    import tomllib
+    from credenvoy.runtime import EXAMPLES, engine_program
+
+    from credenvoy import compiler as c
+    from credenvoy import renderer as render
+
+
+    def synthetic_environment():
+        values = {
+            name: os.environ[name]
+            for name in ("SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP")
+            if name in os.environ
+        }
+        for p in c.PROVIDERS.values():
+            for n in [p.get("key_env")] + p.get("aliases", []):
+                if n:
+                    values[n] = "synthetic-key"
+        values.update(
+            AWS_REGION="us-east-1",
+            AWS_PROFILE="synthetic",
+            AWS_BEARER_TOKEN_BEDROCK="synthetic",
+            GOOGLE_CLOUD_PROJECT="synthetic-project",
+            GOOGLE_CLOUD_LOCATION="us-central1",
+            GOOGLE_APPLICATION_CREDENTIALS="/synthetic/adc.json",
+            ANTHROPIC_FOUNDRY_BASE_URL="https://synthetic.services.ai.azure.com/anthropic",
+            ANTHROPIC_FOUNDRY_API_KEY="synthetic-key",
+            ANTHROPIC_FOUNDRY_AUTH_TOKEN="synthetic-token",
+            AZURE_OPENAI_BASE_URL="https://synthetic.openai.azure.com/openai/v1",
+            AZURE_RESOURCE_NAME="synthetic",
+            CLOUDFLARE_ACCOUNT_ID="synthetic",
+            CLOUDFLARE_GATEWAY_ID="synthetic",
+            GITHUB_COPILOT_OAUTH_TOKEN="synthetic-gho",
+            COPILOT_GITHUB_TOKEN="synthetic-github-pat",
+            GATEWAY_URL="https://synthetic.invalid/v1",
+            GATEWAY_KEY="synthetic-gateway-key",
+            LOCAL_BASE_URL="http://127.0.0.1:11434/v1",
+            AGENTCFG_CLOUDFLARE_AI_GATEWAY_BASE_URL="https://synthetic.invalid/v1",
+        )
+        oauth = {
+            "type": "oauth",
+            "access": "synthetic-access",
+            "refresh": "synthetic-refresh",
+            "expires": 1900000000000,
+        }
+        for n in ("PI_OPENAI_CODEX_OAUTH_JSON", "OPENCODE_V1_OPENAI_OAUTH_JSON"):
+            values[n] = json.dumps(oauth)
+        values["CODEX_AUTH_JSON"] = json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "synthetic-id",
+                    "access_token": "synthetic-access",
+                    "refresh_token": "synthetic-refresh",
+                    "account_id": "synthetic-account",
+                },
+            }
+        )
+        values["CLAUDE_AUTH_JSON"] = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "synthetic-access",
+                    "refreshToken": "synthetic-refresh",
+                    "expiresAt": 1900000000000,
+                }
+            }
+        )
+        values["OPENCODE_OPENAI_AUTH_EXPORT_JSON"] = json.dumps(
+            [
+                {
+                    "id": "cred_synthetic",
+                    "integrationID": "openai",
+                    "label": "test",
+                    "active": True,
+                    "value": {
+                        **oauth,
+                        "methodID": "chatgpt-token-sharing",
+                        "metadata": {
+                            "clientID": "synthetic-client",
+                            "scopes": ["chatgpt.tokens.use.direct"],
+                        },
+                    },
+                }
+            ]
+        )
+        return values
+
+
+    class MatrixTests(unittest.TestCase):
+        def setUp(self):
+            self.patch = patch.dict(os.environ, synthetic_environment(), clear=True)
+            self.patch.start()
+            self.addCleanup(self.patch.stop)
+
+        def test_cartesian_matrix_complete(self):
+            expected = sum(len(p["auth_modes"]) for p in c.PROVIDERS.values()) * len(
+                c.AGENTS
+            )
+            rows = c.matrix()
+            self.assertEqual(len(rows), expected)
+            self.assertEqual(
+                len({(x["agent"], x["provider"], x["auth"]) for x in rows}), expected
+            )
+
+        def test_every_supported_permutation_renders_or_rejects_explicitly(self):
+            for row in c.matrix():
+                with self.subTest(**row):
+                    req = {**row, "model": "synthetic-model"}
+                    if row["route"].startswith("unsupported"):
+                        with self.assertRaises(c.ConfigError):
+                            c.compile_profile(req)
+                        continue
+                    if row["route"] == "gateway-required":
+                        with self.assertRaises(c.ConfigError):
+                            c.compile_profile(req)
+                        req["endpoint"] = {
+                            "protocol": "anthropic-messages"
+                            if row["agent"] == "claude"
+                            else "openai-responses"
+                            if row["agent"] == "codex"
+                            else "openai-completions",
+                            "base_url_env": "GATEWAY_URL",
+                            "key_env": "GATEWAY_KEY",
+                        }
+                    profile = c.compile_profile(req)
+                    files = render.render(profile)
+                    self.assertTrue(files)
+                    for name, value in files.items():
+                        if name.endswith(".toml"):
+                            tomllib.loads(value)
+                        else:
+                            json.loads(json.dumps(value))
+
+        def test_subscription_preserves_client_and_scope(self):
+            p = c.compile_profile(
+                {"agent": "opencode-v2", "provider": "openai-chatgpt", "model": "test"}
+            )
+            value = render.render(p)["credentials.import.json"][0]["value"]
+            self.assertEqual(value["methodID"], "chatgpt-token-sharing")
+            self.assertEqual(value["metadata"]["clientID"], "synthetic-client")
+
+        def test_subscription_does_not_accept_api_key_only(self):
+            with patch.dict(
+                os.environ, {"CODEX_AUTH_JSON": '{"OPENAI_API_KEY":"synthetic"}'}
+            ):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {"agent": "codex", "provider": "openai-chatgpt", "model": "test"}
+                    )
+
+        def test_explicit_legacy_codex_conversion(self):
+            value = json.loads(os.environ["CODEX_AUTH_JSON"])
+            value["tokens"]["oauth_provenance"] = {
+                "issuer": "https://auth.openai.com",
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            }
+            with patch.dict(
+                os.environ,
+                {"CODEX_AUTH_JSON": json.dumps(value), "CODEX_EXPIRY": "1900000000000"},
+            ):
+                for a in ("opencode-v1", "opencode-v2"):
+                    p = c.compile_profile(
+                        {
+                            "agent": a,
+                            "provider": "openai-chatgpt",
+                            "model": "test",
+                            "credential_format": "codex-native-legacy",
+                            "allow_legacy_conversion": True,
+                            "credential_env": "CODEX_AUTH_JSON",
+                            "expires_at_env": "CODEX_EXPIRY",
+                        }
+                    )
+                    files = render.render(p)
+                    credential = (
+                        files["auth.json"]["openai"]
+                        if a == "opencode-v1"
+                        else files["credentials.import.json"][0]["value"]
+                    )
+                    self.assertEqual(credential["access"], "synthetic-access")
+                    self.assertEqual(credential["refresh"], "synthetic-refresh")
+                    if a == "opencode-v2":
+                        self.assertEqual(credential["methodID"], "chatgpt-headless")
+
+        def test_legacy_conversion_rejects_wrong_issuer_client(self):
+            with patch.dict(os.environ, {"CODEX_EXPIRY": "1900000000000"}):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {
+                            "agent": "opencode-v2",
+                            "provider": "openai-chatgpt",
+                            "model": "test",
+                            "credential_format": "codex-native-legacy",
+                            "allow_legacy_conversion": True,
+                            "credential_env": "CODEX_AUTH_JSON",
+                            "expires_at_env": "CODEX_EXPIRY",
+                            "oauth_provenance": {
+                                "issuer": "https://different.invalid",
+                                "client_id": "different",
+                            },
+                        }
+                    )
+
+        def test_token_sharing_requires_granted_scope(self):
+            value = json.loads(os.environ["OPENCODE_OPENAI_AUTH_EXPORT_JSON"])
+            value[0]["value"]["metadata"]["scopes"] = []
+            with patch.dict(
+                os.environ, {"OPENCODE_OPENAI_AUTH_EXPORT_JSON": json.dumps(value)}
+            ):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {
+                            "agent": "opencode-v2",
+                            "provider": "openai-chatgpt",
+                            "model": "test",
+                        }
+                    )
+
+        def test_conflicting_aliases_rejected(self):
+            with patch.dict(os.environ, {"GOOGLE_API_KEY": "different"}):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {"agent": "pi", "provider": "google", "model": "test"}
+                    )
+
+        def test_explicit_per_agent_key_wins(self):
+            with patch.dict(
+                os.environ,
+                {"AGENTCFG_PI_GOOGLE_API_KEY": "override", "GOOGLE_API_KEY": "different"},
+            ):
+                p = c.compile_profile(
+                    {"agent": "pi", "provider": "google", "model": "test"}
+                )
+                self.assertEqual(p["api_key_env"], "AGENTCFG_PI_GOOGLE_API_KEY")
+
+        def test_no_accidental_secret_forwarding_to_gateway(self):
+            with self.assertRaises(c.ConfigError):
+                c.compile_profile(
+                    {
+                        "agent": "claude",
+                        "provider": "openai",
+                        "model": "test",
+                        "endpoint": {
+                            "protocol": "anthropic-messages",
+                            "base_url_env": "GATEWAY_URL",
+                        },
+                    }
+                )
+
+        def test_wrong_gateway_wire_api_rejected(self):
+            with self.assertRaises(c.ConfigError):
+                c.compile_profile(
+                    {
+                        "agent": "codex",
+                        "provider": "groq",
+                        "model": "test",
+                        "endpoint": {
+                            "protocol": "openai-completions",
+                            "base_url_env": "GATEWAY_URL",
+                            "key_env": "GATEWAY_KEY",
+                        },
+                    }
+                )
+
+        def test_no_subscription_gateway_forwarding(self):
+            with self.assertRaises(c.ConfigError):
+                c.compile_profile(
+                    {
+                        "agent": "codex",
+                        "provider": "openai-chatgpt",
+                        "model": "test",
+                        "endpoint": {
+                            "protocol": "openai-responses",
+                            "base_url_env": "GATEWAY_URL",
+                            "key_env": "GATEWAY_KEY",
+                        },
+                    }
+                )
+
+        def test_partial_aws_key_pair_rejected(self):
+            with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "synthetic"}):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {
+                            "agent": "pi",
+                            "provider": "amazon-bedrock",
+                            "auth": "ambient",
+                            "model": "test",
+                        }
+                    )
+
+        def test_all_profiles_prevalidated(self):
+            spec = {
+                "profiles": [
+                    {"agent": "pi", "provider": "openai", "model": "test"},
+                    {"agent": "claude", "provider": "openai", "model": "test"},
+                ]
+            }
+            with self.assertRaises(c.ConfigError):
+                c.compile_spec(spec)
+
+        def test_no_secret_values_in_plan(self):
+            p = c.compile_profile({"agent": "pi", "provider": "openai", "model": "test"})
+            self.assertNotIn("synthetic-key", json.dumps(p))
+
+        def test_remote_plaintext_endpoint_rejected(self):
+            with patch.dict(os.environ, {"GATEWAY_URL": "http://remote.invalid/v1"}):
+                with self.assertRaises(c.ConfigError):
+                    c.compile_profile(
+                        {
+                            "agent": "codex",
+                            "provider": "groq",
+                            "model": "test",
+                            "endpoint": {
+                                "protocol": "openai-responses",
+                                "base_url_env": "GATEWAY_URL",
+                                "key_env": "GATEWAY_KEY",
+                            },
+                        }
+                    )
+
+        def test_sample_plan_and_generation_end_to_end(self):
+            env = dict(os.environ)
+            env.update(
+                {
+                    n: "synthetic-model"
+                    for n in (
+                        "CLAUDE_MODEL",
+                        "OPENAI_MODEL",
+                        "CHATGPT_MODEL",
+                        "COPILOT_MODEL",
+                        "GROQ_MODEL",
+                    )
+                }
+            )
+            with tempfile.TemporaryDirectory() as temp:
+                cli = Path(temp) / "credenvoy.py"
+                cli.write_text(engine_program(), encoding="utf-8")
+                command = [sys.executable, str(cli)]
+                spec = str(Path(temp) / "profiles.json")
+                Path(spec).write_text(json.dumps(EXAMPLES["suite"]), encoding="utf-8")
+                plan = subprocess.run(
+                    command + ["plan", "--spec", spec],
+                    env=env,
+                    cwd=temp,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertNotIn("synthetic-key", plan.stdout)
+                output = Path(temp) / "generated"
+                subprocess.run(
+                    command + ["generate", "--spec", spec, "--out", str(output)],
+                    env=env,
+                    cwd=temp,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(len(list(output.iterdir())), 7)
+                auth = json.loads((output / "codex-chatgpt/auth.json").read_text())
+                self.assertEqual(auth["tokens"]["access_token"], "synthetic-access")
+
+
+    if __name__ == "__main__":
+        unittest.main()
+  TEST_LAUNCHER: |
+    import json
+    import tempfile
+    import unittest
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from credenvoy import launcher as run
+
+
+    class LauncherTests(unittest.TestCase):
+        def test_competing_subscription_and_api_credentials_removed(self):
+            parent = {
+                "PATH": "/bin",
+                "OPENAI_API_KEY": "wrong-api",
+                "CLAUDE_CODE_OAUTH_TOKEN": "wrong-subscription",
+                "COPILOT_GITHUB_TOKEN": "wrong-github",
+                "GITHUB_COPILOT_OAUTH_TOKEN": "wrong-github-oauth",
+                "PI_OPENAI_CODEX_OAUTH_JSON": "wrong-bundle",
+                "CODEX_AUTH_JSON": "wrong-bundle",
+                "MY_KEY": "selected",
+            }
+            runtime = {"adapter": "pi", "references": {"OPENAI_API_KEY": "MY_KEY"}}
+            env = run.runtime_environment("/tmp/profile", runtime, parent)
+            self.assertEqual(env["OPENAI_API_KEY"], "selected")
+            for name in (
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "COPILOT_GITHUB_TOKEN",
+                "GITHUB_COPILOT_OAUTH_TOKEN",
+                "CODEX_AUTH_JSON",
+                "PI_OPENAI_CODEX_OAUTH_JSON",
+            ):
+                self.assertNotIn(name, env)
+            self.assertEqual(
+                env["PI_CODING_AGENT_DIR"], str(Path("/tmp/profile").resolve())
+            )
+
+        def test_opencode_v2_isolated_database(self):
+            env = run.runtime_environment(
+                "/tmp/profile",
+                {"adapter": "opencode-v2"},
+                {"OPENCODE_DB": "/wrong/shared.db"},
+            )
+            self.assertEqual(
+                env["OPENCODE_DB"],
+                str(Path("/tmp/profile").resolve() / "state/opencode/opencode.db"),
+            )
+
+        def test_missing_runtime_reference_rejected(self):
+            with self.assertRaises(ValueError):
+                run.runtime_environment(
+                    "/tmp/profile",
+                    {"adapter": "codex", "references": {"OPENAI_API_KEY": "MISSING"}},
+                    {},
+                )
+
+        def test_open_code_version_mismatch_rejected(self):
+            with patch(
+                "credenvoy.launcher.subprocess.run",
+                return_value=SimpleNamespace(stdout="opencode 1.2.27"),
+            ):
+                with self.assertRaises(ValueError):
+                    run.check_version("opencode-v2", "opencode", {})
+
+        def test_v1_bootstrap_preserves_refreshed_state(self):
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                (folder / "auth.json").write_text('{"new":"bootstrap"}')
+                run.bootstrap(folder, {"adapter": "opencode-v1"}, {})
+                target = folder / "state/opencode/auth.json"
+                target.write_text('{"refreshed":"current"}')
+                run.bootstrap(folder, {"adapter": "opencode-v1"}, {})
+                self.assertEqual(json.loads(target.read_text()), {"refreshed": "current"})
+
+        def test_v2_import_only_once_and_private_server(self):
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                (folder / "credentials.import.json").write_text("[]")
+                with patch(
+                    "credenvoy.launcher.subprocess.run",
+                    side_effect=[
+                        SimpleNamespace(stdout="--standalone"),
+                        SimpleNamespace(stdout="Imported 1 credential"),
+                    ],
+                ) as call:
+                    run.bootstrap(folder, {"adapter": "opencode-v2"}, {})
+                    run.bootstrap(folder, {"adapter": "opencode-v2"}, {})
+                    self.assertEqual(call.call_count, 2)
+                    self.assertIn("--standalone", call.call_args_list[-1].args[0])
+
+        def test_v2_refuses_implicit_shared_server(self):
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                (folder / "credentials.import.json").write_text("[]")
+                with patch(
+                    "credenvoy.launcher.subprocess.run",
+                    return_value=SimpleNamespace(stdout="other flags"),
+                ) as call:
+                    with self.assertRaises(ValueError):
+                        run.bootstrap(folder, {"adapter": "opencode-v2"}, {})
+                    self.assertEqual(call.call_count, 1)
+                    self.assertFalse((folder / "state/.credentials-imported").exists())
+
+
+    if __name__ == "__main__":
+        unittest.main()
+tasks:
+  run:
+    internal: true
+    silent: true
+    cmds:
+    - task: :catalog:_dispatch
+      vars:
+        ACTION: test
+        TEST_RENDERER: '{{.TEST_RENDERER}}'
+        TEST_COMPILER: '{{.TEST_COMPILER}}'
+        TEST_LAUNCHER: '{{.TEST_LAUNCHER}}'

@@ -1,0 +1,108 @@
+version: '3'
+includes:
+  runtime:
+    taskfile: ./tasks/runtime.yml
+    dir: .
+    internal: true
+  catalog:
+    taskfile: ./tasks/catalog.yml
+    dir: .
+    internal: true
+  tests:
+    taskfile: ./tasks/tests.yml
+    dir: .
+    internal: true
+tasks:
+  default:
+    silent: true
+    cmds:
+    - task --list
+  matrix:
+    desc: List every provider/auth/CLI route as JSON
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: matrix
+  matrix:markdown:
+    desc: Print a readable compatibility matrix
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: matrix:markdown
+  example:
+    desc: Print a profile example (AGENTCFG_EXAMPLE selects one)
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: example
+  init:
+    desc: Create profiles.json without overwriting an existing file
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: init
+  validate:
+    desc: Validate selected configuration without writing files
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: validate
+  plan:
+    desc: List selected output files without printing secrets
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: plan
+  generate:
+    desc: Generate private native configuration in a new directory
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: generate
+  run:
+    desc: Launch AGENTCFG_PROFILE with isolated agent state
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: run
+  lint:
+    desc: Check embedded Python syntax and registry invariants
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: lint
+  smoke:
+    desc: Generate a local profile offline in temporary storage
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: smoke
+  export:
+    desc: Export an optional standalone Python engine
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: export
+  test:
+    desc: Run the embedded synthetic test suite and all matrix cases
+    silent: true
+    cmds:
+    - task: tests:run
+  check:
+    desc: Run syntax checks, unit tests and an offline generation smoke test
+    silent: true
+    cmds:
+    - task: lint
+    - task: test
+    - task: smoke

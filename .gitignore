@@ -1,0 +1,28 @@
+# Credentials, private profiles and generated agent state
+.env
+.env.*
+profiles.json
+profiles.*.json
+auth.json
+.credentials.json
+credentials.import.json
+runtime.json
+generated/
+state/
+*.log
+
+# Optional standalone export and source bundles
+credenvoy.py
+*.zip
+*.tar.gz
+
+# Tooling and local editor state
+.task/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,22 @@
+# Security and credential handling
+
+Credenvoy handles credentials supplied by the person running it. Treat generated auth files, native OAuth bundles, optional profile documents containing literals, and refreshed agent state as secrets.
+
+## Report a vulnerability privately
+
+Use GitHub's **Security → Report a vulnerability** option when it is enabled on the repository. Otherwise contact a maintainer privately before sharing sensitive details. Do not post tokens, raw environment dumps, native auth files, or generated state in public issues, discussions, or CI logs.
+
+Useful reports include a synthetic reproducer, the Task/Python/agent CLI versions, operating system, expected behavior, and sanitized observed behavior.
+
+## Current boundaries
+
+- Routine tests use synthetic credentials and do not contact model providers.
+- `plan` reports file names, not resolved credential values.
+- Generation refuses an existing output directory. Unix files/directories are created with restrictive modes.
+- The launcher filters known inherited credential/provider selectors and redirects native agent state. External cloud identities and project-local agent settings can still apply.
+- Bootstrap preserves later refreshes; it is not a cross-process or multi-machine OAuth synchronizer.
+- OAuth client authority, scopes, account entitlement, and API billing are separate concerns. A JSON field conversion cannot manufacture them.
+- Windows ACL hardening is not implemented. Windows CI validates configuration behavior, not a claim of Unix-equivalent access control.
+- The repository's CI uses no model-provider secrets. The manual source-bundle workflow does not publish a package or release.
+
+Never point the launcher at untrusted generated runtime files. Review configurations and any project-level agent hooks/settings before running an agent with access to your workspace.

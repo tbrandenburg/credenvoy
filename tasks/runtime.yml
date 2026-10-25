@@ -1,0 +1,1480 @@
+version: '3'
+vars:
+  PYTHON: python
+  RENDERER_SOURCE: |
+    #!/usr/bin/env python3
+    """Reference env-to-config renderer. Stages artifacts only; never edits live CLI state."""
+
+    import argparse
+    import json
+    import os
+    import re
+    import tempfile
+    from pathlib import Path
+
+    NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+    ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+    def env(name):
+        if not isinstance(name, str) or not ENV.fullmatch(name):
+            raise ValueError("Invalid environment variable name")
+        value = os.environ.get(name)
+        if not value:
+            raise ValueError("Missing environment variable: " + name)
+        return value
+
+
+    def oauth(name):
+        try:
+            value = json.loads(env(name))
+        except json.JSONDecodeError:
+            raise ValueError("Invalid OAuth JSON in " + name) from None
+        if not isinstance(value, dict) or value.get("type") != "oauth":
+            raise ValueError("Expected an OAuth credential object in " + name)
+        for field in ("access", "refresh"):
+            if not isinstance(value.get(field), str) or not value[field]:
+                raise ValueError("Missing OAuth " + field + " in " + name)
+        expiry = value.get("expires")
+        if isinstance(expiry, bool) or not isinstance(expiry, int) or expiry < 0:
+            raise ValueError("Expected nonnegative expires in Unix milliseconds in " + name)
+        return value
+
+
+    def toml_string(value):
+        # JSON basic strings are compatible for these string fields; reject controls
+        # that JSON can encode with escapes TOML doesn't accept.
+        if not isinstance(value, str) or any(ord(c) < 32 for c in value):
+            raise ValueError("Invalid TOML string field")
+        return json.dumps(value, ensure_ascii=False)
+
+
+    def render(profile):
+        agent, provider = profile["agent"], profile["provider"]
+        if not NAME.fullmatch(provider):
+            raise ValueError("Invalid provider ID")
+        key_name = profile.get("api_key_env")
+        oauth_name = profile.get("oauth_json_env")
+        github_name = profile.get("github_oauth_env")
+        native_name = profile.get("native_auth_json_env")
+        if sum(bool(x) for x in (key_name, oauth_name, github_name, native_name)) > 1:
+            raise ValueError("Choose one credential source per profile")
+        # Validate required env values even when output uses runtime references.
+        if key_name:
+            env(key_name)
+        values = oauth(oauth_name) if oauth_name else profile.get("oauth_value")
+        model, base = profile.get("model"), profile.get("base_url")
+        files = {}
+        runtime = {
+            "values": dict(profile.get("env_values", {})),
+            "references": dict(profile.get("env", {})),
+        }
+        for target, value in runtime["values"].items():
+            if not ENV.fullmatch(target) or not isinstance(value, str):
+                raise ValueError("Invalid literal runtime environment value")
+        for target, source in runtime["references"].items():
+            if not ENV.fullmatch(target):
+                raise ValueError("Invalid target environment variable")
+            env(source)
+        command = None
+        if agent == "opencode-v1":
+            if github_name:
+                if provider not in ("github-copilot", "github-copilot-enterprise"):
+                    raise ValueError("GitHub OAuth bootstrap is Copilot-specific")
+                token = env(github_name)
+                values = {"type": "oauth", "refresh": token, "access": token, "expires": 0}
+                if profile.get("enterprise_domain"):
+                    values["enterpriseUrl"] = profile["enterprise_domain"]
+            if key_name:
+                values = {"type": "api", "key": env(key_name)}
+            if values:
+                files["auth.json"] = {provider: values}
+            config = {}
+            if model:
+                config["model"] = provider + "/" + model
+            if base:
+                entry = {"options": {"baseURL": base}}
+                packages = {
+                    "anthropic-messages": "@ai-sdk/anthropic",
+                    "openai-completions": "@ai-sdk/openai-compatible",
+                    "openai-responses": "@ai-sdk/openai",
+                    "google-generative-ai": "@ai-sdk/google",
+                }
+                if profile.get("protocol") in packages:
+                    entry.update(npm=packages[profile["protocol"]], name=provider)
+                    if model:
+                        entry["models"] = {model: {"name": model}}
+                config["provider"] = {provider: entry}
+            files["opencode.json"] = config
+            command = ["opencode"]
+        elif agent == "opencode-v2":
+            if github_name:
+                if provider != "github-copilot":
+                    raise ValueError("V2 uses github-copilot with enterprise metadata")
+                token = env(github_name)
+                values = {
+                    "type": "oauth",
+                    "methodID": "device",
+                    "refresh": token,
+                    "access": token,
+                    "expires": 0,
+                }
+                if profile.get("enterprise_domain"):
+                    values["metadata"] = {"enterpriseUrl": profile["enterprise_domain"]}
+            if key_name:
+                values = {"type": "key", "key": env(key_name)}
+            if values:
+                if values["type"] == "oauth" and not values.get("methodID"):
+                    raise ValueError("V2 OAuth requires provider-specific methodID")
+                if profile.get("metadata"):
+                    values["metadata"] = {
+                        **values.get("metadata", {}),
+                        **profile["metadata"],
+                    }
+                credential_id = profile.get("credential_id")
+                if not credential_id or not NAME.fullmatch(credential_id):
+                    raise ValueError("V2 requires a stable credential_id")
+                files["credentials.import.json"] = [
+                    {
+                        "id": credential_id,
+                        "integrationID": provider,
+                        "label": profile.get("label", "generated"),
+                        "active": True,
+                        "value": values,
+                    }
+                ]
+            if base:
+                package = {
+                    "anthropic-messages": "anthropic-compatible",
+                    "openai-completions": "openai-compatible",
+                    "openai-responses": "openai-compatible/responses",
+                    "google-generative-ai": "google",
+                }.get(profile.get("protocol"))
+                if not package:
+                    raise ValueError(
+                        "V2 custom endpoint requires an explicit supported protocol"
+                    )
+                entry = {
+                    "name": provider,
+                    "package": "@opencode/ai/providers/" + package,
+                    "settings": {"baseURL": base},
+                }
+                if key_name:
+                    entry["env"] = [key_name]
+                if model:
+                    entry["models"] = {model: {"name": model}}
+                files["opencode.json"] = {"providers": {provider: entry}}
+            # V2 provider/model settings use the current plural providers contract.
+            command = ["opencode", "--standalone"]
+            if model:
+                command += ["--model", provider + "/" + model]
+        elif agent == "pi":
+            if github_name:
+                if provider != "github-copilot":
+                    raise ValueError("GitHub token requires github-copilot")
+                runtime["references"]["COPILOT_GITHUB_TOKEN"] = github_name
+                env(github_name)
+            if key_name:
+                # Preserve dynamic env resolution rather than serialize the key.
+                values = {"type": "api_key", "key": "${" + key_name + "}"}
+            if values:
+                if profile.get("env"):
+                    values["env"] = {k: env(v) for k, v in profile["env"].items()}
+                files["auth.json"] = {provider: values}
+            if model:
+                files["settings.json"] = {
+                    "defaultProvider": provider,
+                    "defaultModel": model,
+                }
+            if base:
+                entry = {"baseUrl": base}
+                if profile.get("dummy_key"):
+                    entry["apiKey"] = "local"
+                if profile.get("protocol"):
+                    entry["api"] = profile["protocol"]
+                    if not model:
+                        raise ValueError("Custom Pi endpoint requires a model")
+                    entry["models"] = [{"id": model}]
+                files["models.json"] = {"providers": {provider: entry}}
+            command = ["pi"]
+        elif agent == "claude":
+            if values or github_name:
+                raise ValueError("Use Claude's native env or an opaque native auth bundle")
+            if (
+                provider
+                not in ("anthropic", "amazon-bedrock", "google-vertex", "microsoft-foundry")
+                and profile.get("protocol") != "anthropic-messages"
+            ):
+                raise ValueError(
+                    "Claude requires a supported cloud integration or Messages endpoint"
+                )
+            if key_name and provider in (
+                "amazon-bedrock",
+                "google-vertex",
+                "microsoft-foundry",
+            ):
+                raise ValueError("Use cloud-specific env mappings for cloud credentials")
+            if key_name:
+                runtime["references"]["ANTHROPIC_API_KEY"] = key_name
+            if base:
+                runtime["values"]["ANTHROPIC_BASE_URL"] = base
+            if model:
+                runtime["values"]["ANTHROPIC_MODEL"] = model
+            files["settings.json"] = {
+                "env": {
+                    **runtime["values"],
+                    **{
+                        target: env(source)
+                        for target, source in runtime["references"].items()
+                    },
+                }
+            }
+            command = ["claude"]
+        elif agent == "codex":
+            if values or github_name:
+                raise ValueError("Codex requires a native auth bundle for account login")
+            lines = []
+            if native_name:
+                lines.append('cli_auth_credentials_store = "file"')
+            if model:
+                lines.append("model = " + toml_string(model))
+            if profile.get("native_api_key"):
+                if provider != "openai" or not key_name:
+                    raise ValueError("Native API auth requires openai and an API key")
+                files["auth.json"] = {"OPENAI_API_KEY": env(key_name)}
+                lines.append('cli_auth_credentials_store = "file"')
+            elif provider == "amazon-bedrock" and not base:
+                if key_name:
+                    raise ValueError("Use AWS_BEARER_TOKEN_BEDROCK via env mapping")
+                lines.append('model_provider = "amazon-bedrock"')
+            elif base:
+                if profile.get("protocol") != "openai-responses":
+                    raise ValueError(
+                        "Codex custom endpoint requires verified Responses support"
+                    )
+                lines += [
+                    'model_provider = "generated"',
+                    "[model_providers.generated]",
+                    "name = " + toml_string(provider),
+                    "base_url = " + toml_string(base),
+                    'wire_api = "responses"',
+                    "requires_openai_auth = false",
+                ]
+                if key_name:
+                    if profile.get("api_key_header"):
+                        lines += [
+                            "[model_providers.generated.env_http_headers]",
+                            toml_string(profile["api_key_header"])
+                            + " = "
+                            + toml_string(key_name),
+                        ]
+                    else:
+                        lines.append("env_key = " + toml_string(key_name))
+                if profile.get("query_params"):
+                    lines.append("[model_providers.generated.query_params]")
+                    lines += [
+                        toml_string(k) + " = " + toml_string(v)
+                        for k, v in profile["query_params"].items()
+                    ]
+            elif key_name:
+                raise ValueError("Choose native_api_key or a Responses base_url")
+            files["config.toml"] = "\n".join(lines) + "\n"
+            command = ["codex"]
+        elif agent == "copilot":
+            if values:
+                raise ValueError("Copilot CLI consumes GitHub tokens through native env")
+            if github_name:
+                env(github_name)
+                runtime["references"]["COPILOT_GITHUB_TOKEN"] = github_name
+            if key_name:
+                runtime["references"]["COPILOT_PROVIDER_API_KEY"] = key_name
+            if model:
+                runtime["values"]["COPILOT_MODEL"] = model
+            if base:
+                kind = profile.get("protocol", "openai-completions")
+                kinds = {
+                    "openai-completions": "openai",
+                    "anthropic-messages": "anthropic",
+                    "azure": "azure",
+                }
+                if kind not in kinds or not model:
+                    raise ValueError("Copilot BYOK requires supported protocol and model")
+                runtime["values"].update(
+                    COPILOT_PROVIDER_BASE_URL=base,
+                    COPILOT_PROVIDER_TYPE=kinds[kind],
+                    COPILOT_MODEL=model,
+                )
+            elif key_name:
+                raise ValueError("Copilot BYOK requires base_url")
+            command = ["copilot"]
+        else:
+            raise ValueError("Unsupported adapter: " + agent)
+        export_name = profile.get("auth_export_json_env")
+        if export_name:
+            if agent != "opencode-v2" or any(
+                (key_name, oauth_name, github_name, native_name)
+            ):
+                raise ValueError(
+                    "Native exports require an otherwise credential-free V2 profile"
+                )
+            exported = json.loads(env(export_name))
+            if not isinstance(exported, list) or not exported:
+                raise ValueError("OpenCode export must contain an array of credentials")
+            for entry in exported:
+                if not isinstance(entry, dict) or entry.get("integrationID") != provider:
+                    raise ValueError("OpenCode export has a different provider integration")
+                if not all(k in entry for k in ("id", "label", "active", "value")):
+                    raise ValueError("Incomplete native OpenCode export")
+            files["credentials.import.json"] = exported
+        if native_name:
+            if agent not in ("claude", "codex"):
+                raise ValueError(
+                    "Native auth bundles are supported only for Claude and Codex"
+                )
+            try:
+                native = json.loads(env(native_name))
+            except json.JSONDecodeError:
+                raise ValueError("Invalid native auth JSON") from None
+            if not isinstance(native, dict) or not native:
+                raise ValueError("Native auth bundle must be a nonempty object")
+            files[".credentials.json" if agent == "claude" else "auth.json"] = native
+        if command:
+            if key_name and agent in ("pi", "codex", "opencode-v2"):
+                runtime["references"][key_name] = key_name
+            runtime["adapter"] = agent
+            runtime["command"] = command
+            files["runtime.json"] = runtime
+        return files
+
+
+    def stage(spec, output):
+        # Validate every profile before writing any file.
+        planned = {}
+        for profile in spec["profiles"]:
+            name = profile["name"]
+            if not NAME.fullmatch(name) or name in planned:
+                raise ValueError("Invalid or duplicate profile name")
+            planned[name] = render(profile)
+        output = Path(output)
+        if output.exists():
+            raise ValueError("Output directory already exists; use a new staging directory")
+        output.mkdir(parents=True, mode=0o700)
+        for name, files in planned.items():
+            folder = output / name
+            folder.mkdir(mode=0o700)
+            for filename, value in files.items():
+                text = (
+                    value if isinstance(value, str) else json.dumps(value, indent=2) + "\n"
+                )
+                fd, tmp = tempfile.mkstemp(dir=folder)
+                try:
+                    with os.fdopen(fd, "w") as stream:
+                        stream.write(text)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(tmp, folder / filename)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+        return sum(len(files) for files in planned.values())
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--spec", default="profiles.example.json")
+        parser.add_argument("--out", default="generated")
+        args = parser.parse_args(argv)
+        try:
+            spec = (
+                json.loads(env("AGENT_CONFIG_SPEC"))
+                if os.environ.get("AGENT_CONFIG_SPEC")
+                else json.loads(Path(args.spec).read_text())
+            )
+            count = stage(spec, args.out)
+        except (ValueError, KeyError, TypeError, OSError):
+            # Never echo exception data: it can include secret JSON input.
+            parser.exit(
+                1,
+                "Configuration generation failed; check profile fields, required env vars, and output path.\n",
+            )
+        print("Staged " + str(count) + " files; credentials were not installed.")
+
+
+    if __name__ == "__main__":
+        main()
+  COMPILER_SOURCE: |
+    #!/usr/bin/env python3
+    """Credenvoy: compile provider/auth/CLI permutations into explicit configuration profiles."""
+
+    import argparse
+    import json
+    import os
+    import re
+    from pathlib import Path
+
+    from . import renderer as render
+
+    REGISTRY = globals()["CREDENVOY_REGISTRY"]
+    AGENTS = REGISTRY["agents"]
+    PROVIDERS = REGISTRY["providers"]
+
+
+    class ConfigError(ValueError):
+        pass
+
+
+    def token(value):
+        return re.sub(r"[^A-Za-z0-9]", "_", value).upper()
+
+
+    def variable(name):
+        if not isinstance(name, str) or not render.ENV.fullmatch(name):
+            raise ConfigError("Invalid environment-variable reference")
+        return name
+
+
+    def present(name):
+        return bool(os.environ.get(variable(name)))
+
+
+    def choose(names, required=True):
+        names = list(dict.fromkeys(n for n in names if n))
+        found = [n for n in names if present(n)]
+        if len({os.environ[n] for n in found}) > 1:
+            raise ConfigError("Conflicting aliases: " + ", ".join(found))
+        if found:
+            return found[0]
+        if required:
+            raise ConfigError("Set one of: " + ", ".join(names))
+        return None
+
+
+    def read(name):
+        if not present(name):
+            raise ConfigError("Missing environment variable: " + name)
+        return os.environ[name]
+
+
+    def route(agent, provider, auth):
+        if agent not in AGENTS or provider not in PROVIDERS:
+            raise ConfigError("Unknown agent or provider; add an explicit registry entry")
+        p = PROVIDERS[provider]
+        if auth not in p["auth_modes"]:
+            return "unsupported-auth"
+        kind = p["kind"]
+        if kind == "chatgpt":
+            return (
+                "native-bundle"
+                if agent in ("codex", "opencode-v1", "opencode-v2", "pi")
+                else "unsupported-native"
+            )
+        if kind == "claude-subscription":
+            return "native-bundle" if agent == "claude" else "unsupported-native"
+        if kind == "copilot":
+            if auth == "github_token" and agent.startswith("opencode"):
+                return "unsupported-auth"
+            return (
+                "native-token"
+                if agent in ("copilot", "opencode-v1", "opencode-v2", "pi")
+                else "unsupported-native"
+            )
+        if kind == "aws":
+            return "gateway-required" if agent == "copilot" else "native-cloud"
+        if kind == "gcp":
+            return (
+                "native-cloud"
+                if agent in ("claude", "opencode-v1", "opencode-v2", "pi")
+                else "gateway-required"
+            )
+        if kind == "foundry":
+            if agent == "claude":
+                return "native-cloud"
+            return (
+                "compatible-endpoint"
+                if auth == "api_key"
+                and agent in ("opencode-v1", "opencode-v2", "pi", "copilot")
+                else "gateway-required"
+            )
+        if kind == "azure":
+            return "gateway-required" if agent == "claude" else "native-azure"
+        protocol = p.get("protocol")
+        if protocol == "provider-native" and not agent.startswith("opencode"):
+            return "gateway-required"
+        if agent == "claude":
+            return (
+                "compatible-endpoint"
+                if protocol == "anthropic-messages"
+                else "gateway-required"
+            )
+        if agent == "codex":
+            return (
+                "native-api"
+                if provider == "openai"
+                else (
+                    "compatible-endpoint"
+                    if protocol == "openai-responses"
+                    else "gateway-required"
+                )
+            )
+        if agent == "copilot" and protocol == "google-generative-ai":
+            return "compatible-endpoint"  # Google's separate OpenAI compatibility endpoint
+        return (
+            "native-api"
+            if agent.startswith("opencode") or (agent == "pi" and p.get("pi_builtin"))
+            else "compatible-endpoint"
+        )
+
+
+    def matrix():
+        return [
+            {"agent": a, "provider": pid, "auth": auth, "route": route(a, pid, auth)}
+            for pid, p in PROVIDERS.items()
+            for auth in p["auth_modes"]
+            for a in AGENTS
+        ]
+
+
+    def key_source(req, p):
+        if req.get("key_env"):
+            name = variable(req["key_env"])
+            read(name)
+            return name
+        override = (
+            "AGENTCFG_" + token(req["agent"]) + "_" + token(req["provider"]) + "_API_KEY"
+        )
+        if present(override):
+            return override
+        return choose([p.get("key_env")] + p.get("aliases", []))
+
+
+    def model_for(req):
+        if req.get("model"):
+            return req["model"]
+        source = (
+            req.get("model_env")
+            or "AGENTCFG_" + token(req["agent"]) + "_" + token(req["provider"]) + "_MODEL"
+        )
+        return read(variable(source))
+
+
+    def endpoint_url(value):
+        from urllib.parse import urlsplit
+
+        u = urlsplit(value)
+        if (
+            u.scheme not in ("https", "http")
+            or not u.hostname
+            or u.username
+            or u.password
+            or u.fragment
+        ):
+            raise ConfigError(
+                "Expected an http(s) endpoint without embedded credentials or fragment"
+            )
+        if u.scheme == "http" and u.hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise ConfigError("Remote endpoints require https")
+        return value
+
+
+    def add_refs(profile, names):
+        for n in names:
+            if present(n):
+                profile["env"][n] = n
+
+
+    def native_oauth(req, profile, kind):
+        a = req["agent"]
+        defaults = {
+            ("chatgpt", "codex"): "CODEX_AUTH_JSON",
+            ("chatgpt", "opencode-v1"): "OPENCODE_V1_OPENAI_OAUTH_JSON",
+            ("chatgpt", "opencode-v2"): "OPENCODE_OPENAI_AUTH_EXPORT_JSON",
+            ("chatgpt", "pi"): "PI_OPENAI_CODEX_OAUTH_JSON",
+            ("claude-subscription", "claude"): "CLAUDE_AUTH_JSON",
+        }
+        source = variable(req.get("credential_env") or defaults[(kind, a)])
+        if req.get("credential_format") == "codex-native-legacy":
+            if (
+                kind != "chatgpt"
+                or a not in ("opencode-v1", "opencode-v2")
+                or req.get("allow_legacy_conversion") is not True
+            ):
+                raise ConfigError(
+                    "Legacy Codex conversion requires an explicitly selected OpenCode legacy adapter"
+                )
+            native = json.loads(read(source))
+            fields = native.get("tokens", {})
+            provenance = fields.get("oauth_provenance") or req.get("oauth_provenance")
+            if provenance != {
+                "issuer": "https://auth.openai.com",
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            }:
+                raise ConfigError(
+                    "Legacy conversion requires known matching OAuth issuer/client provenance"
+                )
+            if not all(
+                isinstance(fields.get(k), str) and fields[k]
+                for k in ("access_token", "refresh_token", "id_token")
+            ):
+                raise ConfigError("Incomplete native Codex subscription credentials")
+            expiry = int(read(variable(req["expires_at_env"])))
+            if expiry < 1_000_000_000_000:
+                raise ConfigError(
+                    "Legacy conversion requires explicit Unix-millisecond access-token expiry"
+                )
+            value = {
+                "type": "oauth",
+                "access": fields["access_token"],
+                "refresh": fields["refresh_token"],
+                "expires": expiry,
+            }
+            account = fields.get("account_id")
+            if a == "opencode-v1":
+                if account:
+                    value["accountId"] = account
+            else:
+                value["methodID"] = "chatgpt-headless"
+                if account:
+                    value["metadata"] = {"accountID": account}
+            profile["oauth_value"] = value
+            return
+        # Runtime-only Claude token takes priority only when explicitly selected.
+        if kind == "claude-subscription" and source == "CLAUDE_CODE_OAUTH_TOKEN":
+            read(source)
+            profile["env"][source] = source
+            return
+        read(source)
+        if a in ("codex", "claude"):
+            value = json.loads(os.environ[source])
+            if not isinstance(value, dict):
+                raise ConfigError("Expected a native auth object")
+            if a == "codex":
+                fields = value.get("tokens", {})
+                if not isinstance(fields, dict) or not all(
+                    isinstance(fields.get(k), str) and fields[k]
+                    for k in ("access_token", "refresh_token", "id_token")
+                ):
+                    raise ConfigError(
+                        "Codex subscription bundle requires complete native tokens"
+                    )
+                if value.get("OPENAI_API_KEY"):
+                    raise ConfigError(
+                        "Subscription bundle also contains an API key; select one auth mode"
+                    )
+            else:
+                fields = value.get("claudeAiOauth", {})
+                if (
+                    not isinstance(fields, dict)
+                    or not isinstance(fields.get("accessToken"), str)
+                    or not fields["accessToken"]
+                ):
+                    raise ConfigError(
+                        "Expected a native Claude subscription credential bundle"
+                    )
+            profile["native_auth_json_env"] = source
+        elif a == "opencode-v2":
+            value = json.loads(os.environ[source])
+            if not isinstance(value, list) or not value:
+                raise ConfigError("Expected a native OpenCode export array")
+            for entry in value:
+                v = entry.get("value", {})
+                if (
+                    entry.get("integrationID") != "openai"
+                    or v.get("type") != "oauth"
+                    or v.get("methodID")
+                    not in ("chatgpt-token-sharing", "chatgpt-browser", "chatgpt-headless")
+                ):
+                    raise ConfigError(
+                        "Expected an OpenCode OpenAI subscription OAuth export"
+                    )
+                for k in ("access", "refresh"):
+                    if not isinstance(v.get(k), str) or not v[k]:
+                        raise ConfigError("Incomplete OAuth export")
+                if not isinstance(v.get("expires"), int) or isinstance(v["expires"], bool):
+                    raise ConfigError("Invalid OAuth expiry")
+                m = v.get("metadata", {})
+                if v["methodID"] == "chatgpt-token-sharing" and (
+                    not m.get("clientID")
+                    or "chatgpt.tokens.use.direct" not in m.get("scopes", [])
+                ):
+                    raise ConfigError(
+                        "Token-sharing export requires clientID and granted token-sharing scope"
+                    )
+            profile["auth_export_json_env"] = source
+        else:
+            render.oauth(source)
+            profile["oauth_json_env"] = source
+
+
+    def compile_profile(req):
+        a, pid = req["agent"], req["provider"]
+        if a not in AGENTS or pid not in PROVIDERS:
+            raise ConfigError("Unknown agent/provider")
+        p = PROVIDERS[pid]
+        auth = req.get("auth", p["auth_modes"][0])
+        r = route(a, pid, auth)
+        if r.startswith("unsupported"):
+            raise ConfigError(a + "/" + pid + "/" + auth + ": " + r)
+        profile = {
+            "name": req.get("name", a + "-" + pid + "-" + auth),
+            "agent": a,
+            "provider": p.get("pi_id", pid) if a == "pi" else p.get("opencode_id", pid),
+            "model": model_for(req),
+            "env": {},
+            "env_values": {},
+        }
+        if a in ("claude", "codex") and p["kind"] == "chatgpt":
+            profile["provider"] = "openai"
+        if a == "claude" and p["kind"] == "claude-subscription":
+            profile["provider"] = "anthropic"
+        kind = p["kind"]
+        endpoint = req.get("endpoint")
+        if endpoint:
+            if kind in ("chatgpt", "claude-subscription", "copilot"):
+                raise ConfigError(
+                    "Subscription tokens cannot be forwarded through an arbitrary API-key gateway"
+                )
+            protocol = endpoint.get("protocol")
+            if protocol not in (
+                "anthropic-messages",
+                "openai-completions",
+                "openai-responses",
+                "google-generative-ai",
+                "azure",
+            ):
+                raise ConfigError("Endpoint requires an explicit supported protocol")
+            if a == "claude" and protocol != "anthropic-messages":
+                raise ConfigError("Claude needs Messages protocol")
+            if a == "codex" and protocol != "openai-responses":
+                raise ConfigError("Codex needs Responses protocol")
+            if a == "copilot" and protocol not in (
+                "anthropic-messages",
+                "openai-completions",
+                "azure",
+            ):
+                raise ConfigError("Unsupported Copilot BYOK protocol")
+            profile["provider"] = req.get("custom_provider_id", "generated-" + pid)
+            profile["base_url"] = endpoint_url(read(variable(endpoint["base_url_env"])))
+            profile["protocol"] = protocol
+            if not endpoint.get("keyless"):
+                if not endpoint.get("key_env"):
+                    raise ConfigError(
+                        "Gateway requires its own explicit key_env or keyless=true"
+                    )
+                profile["api_key_env"] = variable(endpoint["key_env"])
+                read(profile["api_key_env"])
+            if a == "pi" and endpoint.get("keyless"):
+                profile["dummy_key"] = True
+        elif r == "gateway-required":
+            raise ConfigError(
+                a
+                + "/"
+                + pid
+                + ": supply endpoint with compatible protocol and explicit gateway credential"
+            )
+        elif kind in ("chatgpt", "claude-subscription"):
+            native_oauth(req, profile, kind)
+        elif kind == "copilot":
+            source = variable(
+                req.get("credential_env")
+                or (
+                    "GITHUB_COPILOT_OAUTH_TOKEN"
+                    if auth == "oauth"
+                    else "COPILOT_GITHUB_TOKEN"
+                )
+            )
+            read(source)
+            if auth == "github_token" and a.startswith("opencode"):
+                raise ConfigError(
+                    "OpenCode Copilot bootstrap requires upstream OAuth, not an arbitrary PAT/session token"
+                )
+            profile["github_oauth_env"] = source
+            if req.get("enterprise_domain"):
+                profile["enterprise_domain"] = req["enterprise_domain"]
+        elif kind == "aws":
+            profile["provider"] = "amazon-bedrock"
+            if auth == "bearer":
+                source = variable(req.get("credential_env", "AWS_BEARER_TOKEN_BEDROCK"))
+                read(source)
+                profile["env"]["AWS_BEARER_TOKEN_BEDROCK"] = source
+            else:
+                if present("AWS_ACCESS_KEY_ID") != present("AWS_SECRET_ACCESS_KEY"):
+                    raise ConfigError("AWS access key and secret must be supplied together")
+                add_refs(
+                    profile,
+                    [
+                        "AWS_PROFILE",
+                        "AWS_ACCESS_KEY_ID",
+                        "AWS_SECRET_ACCESS_KEY",
+                        "AWS_SESSION_TOKEN",
+                        "AWS_WEB_IDENTITY_TOKEN_FILE",
+                        "AWS_ROLE_ARN",
+                        "AWS_ROLE_SESSION_NAME",
+                        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                        "AWS_SHARED_CREDENTIALS_FILE",
+                        "AWS_CONFIG_FILE",
+                    ],
+                )
+            region = choose(
+                ["AWS_REGION", "AWS_DEFAULT_REGION"], required=not present("AWS_PROFILE")
+            )
+            if region:
+                profile["env"]["AWS_REGION"] = region
+            if a == "claude":
+                profile["env_values"]["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        elif kind == "gcp":
+            project = choose(
+                [
+                    "GOOGLE_CLOUD_PROJECT",
+                    "GCLOUD_PROJECT",
+                    "GOOGLE_VERTEX_PROJECT",
+                    "ANTHROPIC_VERTEX_PROJECT_ID",
+                ]
+            )
+            location = choose(
+                ["GOOGLE_CLOUD_LOCATION", "GOOGLE_VERTEX_LOCATION", "CLOUD_ML_REGION"]
+            )
+            if a == "claude":
+                profile["env_values"]["CLAUDE_CODE_USE_VERTEX"] = "1"
+                profile["env"].update(
+                    ANTHROPIC_VERTEX_PROJECT_ID=project, CLOUD_ML_REGION=location
+                )
+            else:
+                profile["env"].update(
+                    GOOGLE_CLOUD_PROJECT=project,
+                    GOOGLE_CLOUD_LOCATION=location,
+                    GOOGLE_VERTEX_PROJECT=project,
+                    GOOGLE_VERTEX_LOCATION=location,
+                )
+            add_refs(profile, ["GOOGLE_APPLICATION_CREDENTIALS"])
+        elif kind == "foundry" and a == "claude":
+            profile["provider"] = "microsoft-foundry"
+            profile["env_values"]["CLAUDE_CODE_USE_FOUNDRY"] = "1"
+            source = (
+                "ANTHROPIC_FOUNDRY_BASE_URL"
+                if present("ANTHROPIC_FOUNDRY_BASE_URL")
+                else "ANTHROPIC_FOUNDRY_RESOURCE"
+            )
+            read(source)
+            profile["env"][source] = source
+            if auth == "api_key":
+                profile["env"]["ANTHROPIC_FOUNDRY_API_KEY"] = key_source(req, p)
+            if auth == "bearer":
+                source = variable(req.get("credential_env", "ANTHROPIC_FOUNDRY_AUTH_TOKEN"))
+                read(source)
+                profile["env"]["ANTHROPIC_FOUNDRY_AUTH_TOKEN"] = source
+            add_refs(
+                profile,
+                [
+                    "AZURE_TENANT_ID",
+                    "AZURE_CLIENT_ID",
+                    "AZURE_CLIENT_SECRET",
+                    "AZURE_FEDERATED_TOKEN_FILE",
+                ],
+            )
+        elif kind == "local":
+            profile["base_url"] = endpoint_url(
+                read(variable(req.get("base_url_env", p["base_url_env"])))
+            )
+            profile["protocol"] = p["protocol"]
+            if a == "pi":
+                profile["dummy_key"] = True
+        else:
+            source = key_source(req, p)
+            profile["api_key_env"] = source
+            if a == "codex" and pid == "openai":
+                profile["native_api_key"] = True
+            if kind == "azure":
+                base = endpoint_url(
+                    read(variable(req.get("base_url_env", p["base_url_env"])))
+                )
+                if a == "pi":
+                    profile["env"]["AZURE_OPENAI_API_KEY"] = source
+                    profile["env"]["AZURE_OPENAI_BASE_URL"] = req.get(
+                        "base_url_env", p["base_url_env"]
+                    )
+                elif a.startswith("opencode"):
+                    profile["env"]["AZURE_API_KEY"] = source
+                    resource = choose(["AZURE_RESOURCE_NAME", "AZURE_OPENAI_RESOURCE_NAME"])
+                    profile["env"]["AZURE_RESOURCE_NAME"] = resource
+                    if a == "opencode-v2":
+                        profile.pop(
+                            "api_key_env", None
+                        )  # native environment route avoids guessing provider setup-form metadata
+                elif a == "codex":
+                    profile.update(
+                        base_url=base, protocol="openai-responses", api_key_header="api-key"
+                    )
+                elif a == "copilot":
+                    profile.update(base_url=base, protocol="azure")
+                if present("AZURE_OPENAI_API_VERSION"):
+                    profile["env"][
+                        "COPILOT_PROVIDER_AZURE_API_VERSION"
+                        if a == "copilot"
+                        else "AZURE_OPENAI_API_VERSION"
+                    ] = "AZURE_OPENAI_API_VERSION"
+                    if a == "codex":
+                        profile["query_params"] = {
+                            "api-version": os.environ["AZURE_OPENAI_API_VERSION"]
+                        }
+            else:
+                needs_endpoint = (
+                    a in ("claude", "copilot")
+                    or (a == "pi" and not p.get("pi_builtin"))
+                    or kind == "foundry"
+                )
+                if needs_endpoint:
+                    base = p.get("base_url")
+                    if pid == "google" and a == "copilot":
+                        base = "https://generativelanguage.googleapis.com/v1beta/openai"
+                        protocol = "openai-completions"
+                    else:
+                        protocol = (
+                            "openai-completions"
+                            if a == "copilot" and pid == "openai"
+                            else p.get("protocol")
+                        )
+                    if not base:
+                        base = read(
+                            variable(
+                                req.get(
+                                    "base_url_env",
+                                    p.get(
+                                        "base_url_env",
+                                        "AGENTCFG_" + token(pid) + "_BASE_URL",
+                                    ),
+                                )
+                            )
+                        )
+                    for name in re.findall(r"\$\{([A-Z_]+)\}", base):
+                        base = base.replace("${" + name + "}", read(name))
+                    # Anthropic SDKs append /v1/messages themselves; Pi keeps /v1.
+                    if (
+                        a in ("claude", "copilot")
+                        and protocol == "anthropic-messages"
+                        and base.endswith("/v1")
+                    ):
+                        base = base[:-3]
+                    profile.update(base_url=endpoint_url(base), protocol=protocol)
+                if a.startswith("opencode") and pid in ("zai", "zai-coding-plan"):
+                    profile["env"]["ZHIPU_API_KEY"] = source
+                if pid == "cloudflare-workers-ai":
+                    account = choose(["CLOUDFLARE_ACCOUNT_ID"])
+                    profile["env"]["CLOUDFLARE_ACCOUNT_ID"] = account
+                if pid == "cloudflare-ai-gateway":
+                    for n in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"):
+                        read(n)
+                        profile["env"][n] = n
+                    profile["env"][
+                        "CLOUDFLARE_API_TOKEN"
+                        if a.startswith("opencode")
+                        else "CLOUDFLARE_API_KEY"
+                    ] = source
+        if a == "opencode-v2":
+            profile["credential_id"] = req.get(
+                "credential_id", "cred_generated_" + token(profile["name"]).lower()
+            )
+        return profile
+
+
+    def load_spec(path):
+        if os.environ.get("AGENT_CONFIG_SPEC"):
+            return json.loads(os.environ["AGENT_CONFIG_SPEC"])
+        return json.loads(Path(path).read_text())
+
+
+    def compile_spec(spec):
+        profiles = spec.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            raise ConfigError("profiles must be a nonempty array")
+        names = set()
+        compiled = []
+        for req in profiles:
+            try:
+                p = compile_profile(req)
+            except (ValueError, KeyError, TypeError):
+                # Do not include input values; credential JSON may contain secrets.
+                raise ConfigError(
+                    "Cannot compile "
+                    + str(req.get("name", req.get("agent", "profile")))
+                    + ": check matrix route, model, credential source, aliases and required endpoint/cloud settings"
+                ) from None
+            if p["name"] in names or not render.NAME.fullmatch(p["name"]):
+                raise ConfigError("Duplicate or invalid profile name")
+            names.add(p["name"])
+            compiled.append(p)
+        return {"profiles": compiled}
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("action", choices=["matrix", "plan", "generate"])
+        parser.add_argument(
+            "--spec", default=os.environ.get("AGENTCFG_SPEC", "profiles.json")
+        )
+        parser.add_argument("--out", default=os.environ.get("AGENTCFG_OUTPUT", "generated"))
+        args = parser.parse_args(argv)
+        try:
+            if args.action == "matrix":
+                print(
+                    json.dumps(
+                        {
+                            "provider_count": len(PROVIDERS),
+                            "agent_count": len(AGENTS),
+                            "cells": matrix(),
+                        },
+                        indent=2,
+                    )
+                )
+                return
+            spec = compile_spec(load_spec(args.spec))
+            if args.action == "plan":
+                # Run renderer validation, but never print rendered files or secrets.
+                for p in spec["profiles"]:
+                    files = render.render(p)
+                    print(p["name"] + ": " + ", ".join(sorted(files)))
+            else:
+                n = render.stage(spec, args.out)
+                print(
+                    "Generated "
+                    + str(n)
+                    + " files across "
+                    + str(len(spec["profiles"]))
+                    + " profiles. No live CLI credentials changed."
+                )
+        except (ConfigError, ValueError, KeyError, TypeError, OSError) as exc:
+            message = (
+                str(exc)
+                if isinstance(exc, ConfigError)
+                else "Invalid configuration or environment; no secret values are shown"
+            )
+            parser.exit(1, message + "\n")
+
+
+    if __name__ == "__main__":
+        main()
+  LAUNCHER_SOURCE: |
+    #!/usr/bin/env python3
+    """Credenvoy: launch a generated profile with isolated agent state and runtime env mapping."""
+
+    import argparse
+    import json
+    import os
+    import re
+    import subprocess
+    from pathlib import Path
+
+    from . import compiler as configure
+
+    # Remove inherited credentials/provider selectors before applying a selected profile.
+    # Ambient cloud credential files/roles remain external identity sources by design.
+    RESET = {
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_PROFILE",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_FOUNDRY_RESOURCE",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_OAUTH_TOKEN",
+        "CODEX_ACCESS_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "COPILOT_PROVIDER_BASE_URL",
+        "COPILOT_PROVIDER_TYPE",
+        "COPILOT_PROVIDER_WIRE_API",
+        "COPILOT_PROVIDER_AZURE_API_VERSION",
+        "COPILOT_MODEL",
+        "AWS_PROFILE",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_VERTEX_PROJECT",
+        "GOOGLE_VERTEX_LOCATION",
+        "GCLOUD_PROJECT",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "CLOUD_ML_REGION",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_TENANT_ID",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_DB",
+    }
+    for p in configure.PROVIDERS.values():
+        RESET.update(n for n in [p.get("key_env")] + p.get("aliases", []) if n)
+    RESET.update(globals()["CREDENVOY_ENV_NAMES"])
+
+
+    def runtime_environment(folder, runtime, parent):
+        adapter = runtime["adapter"]
+        env = {k: v for k, v in parent.items() if k not in RESET}
+        # Also remove all known catalog credential variables and caller-specific overrides.
+        for k in list(env):
+            if (
+                k.startswith("AGENTCFG_")
+                or k.endswith(("_AUTH_JSON", "_OAUTH_JSON", "_AUTH_EXPORT_JSON"))
+                or k == "AGENT_CONFIG_SPEC"
+            ):
+                env.pop(k, None)
+        env.update(runtime.get("values", {}))
+        for target, source in runtime.get("references", {}).items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", target) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", source
+            ):
+                raise ValueError("Invalid runtime env reference")
+            if not parent.get(source):
+                raise ValueError("Missing runtime credential/configuration variable")
+            env[target] = parent[source]
+        folder = str(Path(folder).resolve())
+        if adapter == "claude":
+            env["CLAUDE_CONFIG_DIR"] = folder
+        elif adapter == "codex":
+            env["CODEX_HOME"] = folder
+        elif adapter == "pi":
+            env["PI_CODING_AGENT_DIR"] = folder
+        elif adapter == "copilot":
+            env["COPILOT_HOME"] = folder
+        elif adapter.startswith("opencode"):
+            env["XDG_DATA_HOME"] = str(Path(folder) / "state")
+            env["XDG_CONFIG_HOME"] = str(Path(folder) / "config")
+            env["XDG_CACHE_HOME"] = str(Path(folder) / "cache")
+            if Path(folder, "opencode.json").exists():
+                env["OPENCODE_CONFIG"] = str(Path(folder) / "opencode.json")
+            if adapter == "opencode-v2":
+                env["OPENCODE_DB"] = str(Path(folder) / "state/opencode/opencode.db")
+        return env
+
+
+    def check_version(adapter, executable, env):
+        result = subprocess.run(
+            [executable, "--version"], env=env, capture_output=True, text=True, check=True
+        )
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)", result.stdout)
+        if not match:
+            raise ValueError("Cannot identify installed CLI version")
+        major, _, _ = map(int, match.groups())
+        if adapter == "opencode-v1" and major != 1:
+            raise ValueError("Profile requires OpenCode V1")
+        if adapter == "opencode-v2" and major != 2:
+            raise ValueError("Profile requires OpenCode V2")
+        if adapter == "pi" and major < 1:
+            raise ValueError("Profile requires current Pi 1.x env-reference syntax")
+
+
+    def bootstrap(folder, runtime, env):
+        adapter = runtime["adapter"]
+        if adapter == "opencode-v1" and (folder / "auth.json").exists():
+            target = folder / "state/opencode/auth.json"
+            if not target.exists():
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as out:
+                    out.write((folder / "auth.json").read_bytes())
+        if adapter == "opencode-v2" and (folder / "credentials.import.json").exists():
+            marker = folder / "state/.credentials-imported"
+            if marker.exists():
+                return
+            help_result = subprocess.run(
+                ["opencode", "auth", "import", "--help"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            if "--standalone" not in help_result.stdout:
+                raise ValueError(
+                    "Installed OpenCode auth import lacks standalone mode; refusing to target a shared server"
+                )
+            marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Capture import output because third-party error text may include credentials.
+            subprocess.run(
+                [
+                    "opencode",
+                    "auth",
+                    "import",
+                    str(folder / "credentials.import.json"),
+                    "--standalone",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            marker.touch(mode=0o600)
+
+
+    def main(argv=None):
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--profile", default=os.environ.get("AGENTCFG_PROFILE"))
+        parser.add_argument("--out", default=os.environ.get("AGENTCFG_OUTPUT", "generated"))
+        parser.add_argument("args", nargs=argparse.REMAINDER)
+        args = parser.parse_args(argv)
+        try:
+            if not args.profile or not configure.render.NAME.fullmatch(args.profile):
+                raise ValueError("Set AGENTCFG_PROFILE to a generated profile name")
+            root = Path(args.out).resolve()
+            folder = root / args.profile
+            if folder.is_symlink() or folder.resolve().parent != root:
+                raise ValueError("Unsafe profile path")
+            runtime = json.loads((folder / "runtime.json").read_text())
+            env = runtime_environment(folder, runtime, os.environ)
+            command = runtime["command"]
+            expected = {
+                "claude": "claude",
+                "codex": "codex",
+                "pi": "pi",
+                "copilot": "copilot",
+                "opencode-v1": "opencode",
+                "opencode-v2": "opencode",
+            }
+            if command[0] != expected[runtime["adapter"]]:
+                raise ValueError("Unexpected CLI command")
+            check_version(runtime["adapter"], command[0], env)
+            bootstrap(folder, runtime, env)
+            extra = args.args[1:] if args.args[:1] == ["--"] else args.args
+            os.execvpe(command[0], command + extra, env)
+        except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
+            parser.exit(
+                1,
+                "Cannot launch profile: check CLI version, source env, generated files, and standalone import support. No credential values are shown.\n",
+            )
+
+
+    if __name__ == "__main__":
+        main()
+  BOOTSTRAP_SOURCE: |
+    import ast
+    import json
+    import os
+    import sys
+    import tempfile
+    import types
+    import unittest
+    from pathlib import Path
+
+    _PAYLOAD = globals()["_PAYLOAD"]
+    _BOOTSTRAP_SOURCE = globals()["_BOOTSTRAP_SOURCE"]
+    VERSION = "0.1.0"
+    EXAMPLES = _PAYLOAD["examples"]
+
+
+    def engine_program():
+        """Export only the embedded implementation and public metadata, never process env."""
+        return (
+            "_PAYLOAD = "
+            + repr(_PAYLOAD)
+            + "\n_BOOTSTRAP_SOURCE = "
+            + repr(_BOOTSTRAP_SOURCE)
+            + "\nexec(compile(_BOOTSTRAP_SOURCE, '<credenvoy.runtime>', 'exec'))\n"
+        )
+
+
+    def load_module(name, source, extra=None):
+        module = types.ModuleType(name)
+        module.__package__ = name.rsplit(".", 1)[0]
+        module.__file__ = "<" + name + ">"
+        module.__dict__.update(extra or {})
+        sys.modules[name] = module
+        parent, _, child = name.rpartition(".")
+        if parent in sys.modules:
+            setattr(sys.modules[parent], child, module)
+        exec(compile(source, module.__file__, "exec"), module.__dict__)
+        return module
+
+
+    package = types.ModuleType("credenvoy")
+    package.__path__ = []
+    package.__version__ = VERSION
+    sys.modules["credenvoy"] = package
+    renderer = load_module("credenvoy.renderer", _PAYLOAD["sources"]["renderer"])
+    compiler = load_module(
+        "credenvoy.compiler",
+        _PAYLOAD["sources"]["compiler"],
+        {"CREDENVOY_REGISTRY": _PAYLOAD["registry"]},
+    )
+    launcher = load_module(
+        "credenvoy.launcher",
+        _PAYLOAD["sources"]["launcher"],
+        {"CREDENVOY_ENV_NAMES": _PAYLOAD["env_names"]},
+    )
+    runtime = types.ModuleType("credenvoy.runtime")
+    runtime.EXAMPLES = EXAMPLES
+    runtime.engine_program = engine_program
+    sys.modules["credenvoy.runtime"] = runtime
+    package.runtime = runtime
+
+
+    def markdown_matrix():
+        agents = compiler.AGENTS
+        print("| Provider/service | Authentication | " + " | ".join(agents) + " |")
+        print("|---|---|" + "---|" * len(agents))
+        for pid, provider in compiler.PROVIDERS.items():
+            for auth in provider["auth_modes"]:
+                print(
+                    "| "
+                    + pid
+                    + " | "
+                    + auth
+                    + " | "
+                    + " | ".join(compiler.route(a, pid, auth) for a in agents)
+                    + " |"
+                )
+
+
+    def check_sources():
+        for name, source in {**_PAYLOAD["sources"], **_PAYLOAD["tests"]}.items():
+            ast.parse(source, filename=name)
+        assert len(compiler.AGENTS) == len(set(compiler.AGENTS))
+        for pid, provider in compiler.PROVIDERS.items():
+            assert renderer.NAME.fullmatch(pid)
+            assert provider["auth_modes"]
+            assert len(provider["auth_modes"]) == len(set(provider["auth_modes"]))
+        matrix = compiler.matrix()
+        assert len(matrix) == len({(x["provider"], x["auth"], x["agent"]) for x in matrix})
+        print(
+            "Embedded Python syntax and registry invariants pass: "
+            + str(len(matrix))
+            + " permutations."
+        )
+
+
+    def run_tests():
+        if not _PAYLOAD["tests"]:
+            raise ValueError(
+                "This export has no embedded tests; run task test in the repository"
+            )
+        package = types.ModuleType("credenvoy.tests")
+        package.__path__ = []
+        sys.modules["credenvoy.tests"] = package
+        suite = unittest.TestSuite()
+        for name, source in _PAYLOAD["tests"].items():
+            module = load_module("credenvoy.tests." + name, source)
+            suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if not result.wasSuccessful():
+            raise SystemExit(1)
+
+
+    def example():
+        selected = os.environ.get("AGENTCFG_EXAMPLE", "local")
+        if selected not in EXAMPLES:
+            raise ValueError(
+                "Unknown example; choose local, openai, suite, gateway or codex-to-opencode-legacy"
+            )
+        return EXAMPLES[selected]
+
+
+    def main(argv=None):
+        args = sys.argv[1:] if argv is None else argv
+        if not args or args[0] in ("help", "--help", "-h"):
+            print(
+                "Credenvoy " + VERSION + " — your credentials, delivered to every agent.\n"
+                "Commands: matrix, matrix:markdown, example, init, validate, plan, generate, run, lint, test, smoke, export\n"
+                "Selection: AGENTCFG_SPEC, AGENTCFG_OUTPUT, AGENTCFG_PROFILE, AGENTCFG_EXAMPLE"
+            )
+            return
+        action, tail = args[0], args[1:]
+        if action == "--version":
+            print("Credenvoy " + VERSION)
+        elif action in ("matrix", "plan", "generate", "validate"):
+            compiler.main(["plan" if action == "validate" else action, *tail])
+        elif action == "run":
+            launcher.main(tail)
+        elif action == "matrix:markdown":
+            markdown_matrix()
+        elif action == "example":
+            print(json.dumps(example(), indent=2))
+        elif action == "init":
+            path = Path(os.environ.get("AGENTCFG_SPEC", "profiles.json"))
+            content = json.dumps(example(), indent=2) + "\n"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
+            print(
+                "Created "
+                + str(path)
+                + "; edit the example model and export its required environment variables."
+            )
+        elif action == "lint":
+            check_sources()
+        elif action == "test":
+            run_tests()
+        elif action == "smoke":
+            with tempfile.TemporaryDirectory() as temp:
+                os.environ["LOCAL_BASE_URL"] = "http://127.0.0.1:11434/v1"
+                spec = compiler.compile_spec(EXAMPLES["local"])
+                count = renderer.stage(spec, Path(temp) / "generated")
+                assert count > 0
+            print("Offline local-profile generation passes; no agent CLI was launched.")
+        elif action == "export":
+            path = Path(os.environ.get("AGENTCFG_EXPORT", "credenvoy.py"))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(engine_program())
+            print("Exported the self-contained engine to " + str(path))
+        else:
+            raise ValueError("Unknown command")
+
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except (ValueError, KeyError, TypeError, OSError):
+            raise SystemExit(
+                "Credenvoy failed: check the selected profile, inputs and output path. No secret values are shown."
+            ) from None
+tasks:
+  _dispatch:
+    internal: true
+    silent: true
+    cmds:
+    - |
+      "{{.PYTHON}}" - "{{.ACTION}}" <<'CREDENVOY_PYTHON'
+      import json
+      _PAYLOAD = {
+          "sources": {
+              "renderer": {{.RENDERER_SOURCE | toJson}},
+              "compiler": {{.COMPILER_SOURCE | toJson}},
+              "launcher": {{.LAUNCHER_SOURCE | toJson}},
+          },
+          "tests": {
+              {{if eq .ACTION "test"}}
+              "test_renderer": {{.TEST_RENDERER | toJson}},
+              "test_compiler": {{.TEST_COMPILER | toJson}},
+              "test_launcher": {{.TEST_LAUNCHER | toJson}},
+              {{end}}
+          },
+          "registry": json.loads({{.REGISTRY | toJson}}),
+          "env_names": json.loads({{.ENV_NAMES | toJson}}),
+          "examples": json.loads({{.EXAMPLES | toJson}}),
+      }
+      _BOOTSTRAP_SOURCE = {{.BOOTSTRAP_SOURCE | toJson}}
+      exec(compile(_BOOTSTRAP_SOURCE, '<credenvoy.runtime>', 'exec'))
+      CREDENVOY_PYTHON
