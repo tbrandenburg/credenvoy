@@ -1098,7 +1098,7 @@ vars:
         def test_native_commands_use_stdin_preflight_and_database_backup(self):
             db = self.home / ".local/share/opencode/opencode.db"
             db.parent.mkdir(parents=True)
-            with sqlite3.connect(db) as connection:
+            with contextlib.closing(sqlite3.connect(db)) as connection, connection:
                 connection.execute("CREATE TABLE keep (value TEXT)")
                 connection.execute("INSERT INTO keep VALUES ('KEEP')")
             plan = install.Installation()
@@ -1107,17 +1107,32 @@ vars:
                     "opencode-v2", api_key_env="TEST_KEY", credential_id="synthetic"
                 )
             )
-            with patch(
-                "credenvoy.installer.subprocess.run",
-                side_effect=[
-                    SimpleNamespace(stdout="--standalone", stderr=""),
-                    SimpleNamespace(stdout="2.0.0", stderr=""),
-                    SimpleNamespace(stdout="[]", stderr=""),
-                    SimpleNamespace(stdout="", stderr=""),
-                ],
-            ) as call:
+            real_connect = sqlite3.connect
+            opened = []
+
+            def track_connection(*args, **kwargs):
+                connection = real_connect(*args, **kwargs)
+                opened.append(connection)
+                return connection
+
+            with (
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    side_effect=[
+                        SimpleNamespace(stdout="--standalone", stderr=""),
+                        SimpleNamespace(stdout="2.0.0", stderr=""),
+                        SimpleNamespace(stdout="[]", stderr=""),
+                        SimpleNamespace(stdout="", stderr=""),
+                    ],
+                ) as call,
+                patch("credenvoy.installer.sqlite3.connect", side_effect=track_connection),
+            ):
                 self.apply(plan)
             self.assertEqual(call.call_count, 4)
+            self.assertEqual(len(opened), 2)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
             args, kwargs = call.call_args
             self.assertEqual(args[0], ["opencode", "auth", "import", "--standalone"])
             self.assertEqual(
@@ -1125,7 +1140,7 @@ vars:
             )
             self.assertNotIn(os.environ["TEST_KEY"], str(args))
             backup = next(db.parent.glob("opencode.db.credenvoy-backup-*"))
-            with sqlite3.connect(backup) as connection:
+            with contextlib.closing(sqlite3.connect(backup)) as connection:
                 self.assertEqual(
                     connection.execute("SELECT value FROM keep").fetchone(), ("KEEP",)
                 )
@@ -1133,7 +1148,7 @@ vars:
         def test_v2_conflicting_existing_credentials_fail_before_file_writes(self):
             db = self.home / ".local/share/opencode/opencode.db"
             db.parent.mkdir(parents=True)
-            with sqlite3.connect(db):
+            with contextlib.closing(sqlite3.connect(db)):
                 pass
             plan = install.Installation()
             plan.add(
@@ -1284,6 +1299,56 @@ vars:
                         credential_id="synthetic",
                     )
                 )
+
+        def test_explicit_destinations_do_not_require_discoverable_home(self):
+            overrides = {
+                "CLAUDE_CONFIG_DIR": self.home / "claude",
+                "CODEX_HOME": self.home / "codex",
+                "PI_CODING_AGENT_DIR": self.home / "pi",
+                "COPILOT_HOME": self.home / "copilot",
+                "XDG_DATA_HOME": self.home / "data",
+                "XDG_CONFIG_HOME": self.home / "config",
+            }
+            with (
+                patch.dict(
+                    os.environ, {key: str(value) for key, value in overrides.items()}
+                ),
+                patch(
+                    "credenvoy.installer.Path.home",
+                    side_effect=RuntimeError("No discoverable home"),
+                ),
+            ):
+                for agent in ("claude", "codex", "pi", "copilot"):
+                    with self.subTest(agent=agent):
+                        self.assertEqual(
+                            install.destinations(agent), (self.home / agent, None)
+                        )
+                for agent in ("opencode-v1", "opencode-v2"):
+                    with self.subTest(agent=agent):
+                        self.assertEqual(
+                            install.destinations(agent),
+                            (
+                                self.home / "data/opencode",
+                                self.home / "config/opencode/opencode.json",
+                            ),
+                        )
+                os.environ.pop("XDG_CONFIG_HOME")
+                with patch.dict(
+                    os.environ, {"OPENCODE_CONFIG": str(self.home / "custom.json")}
+                ):
+                    self.assertEqual(
+                        install.destinations("opencode-v1")[1], self.home / "custom.json"
+                    )
+
+        def test_missing_home_without_override_has_clean_diagnostic(self):
+            with patch(
+                "credenvoy.installer.Path.home",
+                side_effect=RuntimeError("No discoverable home"),
+            ):
+                with self.assertRaisesRegex(
+                    install.InstallError, "explicit CLI home/config override"
+                ):
+                    install.destinations("pi")
 tasks:
   run:
     internal: true

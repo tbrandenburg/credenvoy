@@ -1284,6 +1284,7 @@ vars:
     import tempfile
     import tomllib
     import uuid
+    from contextlib import closing
     from pathlib import Path
 
     from credenvoy import compiler, launcher, renderer
@@ -1294,28 +1295,45 @@ vars:
 
 
     def location(variable, fallback):
-        path = Path(os.environ.get(variable) or fallback).expanduser()
+        try:
+            value = os.environ.get(variable)
+            if not value:
+                value = fallback() if callable(fallback) else fallback
+            path = Path(value).expanduser()
+        except RuntimeError:
+            raise InstallError(
+                "Cannot determine user home; set an explicit CLI home/config override"
+            ) from None
         if not path.is_absolute():
             raise InstallError("CLI home/config overrides must be absolute paths")
         return path
 
 
     def destinations(agent):
-        home = Path.home()
         if agent.startswith("opencode"):
-            data = location("XDG_DATA_HOME", home / ".local/share") / "opencode"
-            config = location("XDG_CONFIG_HOME", home / ".config") / "opencode"
-            default = config / "opencode.json"
-            if (config / "opencode.jsonc").exists():
-                default = config / "opencode.jsonc"
-            return data, location("OPENCODE_CONFIG", default)
-        variable, fallback = {
-            "claude": ("CLAUDE_CONFIG_DIR", home / ".claude"),
-            "codex": ("CODEX_HOME", home / ".codex"),
-            "pi": ("PI_CODING_AGENT_DIR", home / ".pi/agent"),
-            "copilot": ("COPILOT_HOME", home / ".copilot"),
+            data = (
+                location("XDG_DATA_HOME", lambda: Path.home() / ".local/share") / "opencode"
+            )
+
+            def default_config():
+                config = (
+                    location("XDG_CONFIG_HOME", lambda: Path.home() / ".config")
+                    / "opencode"
+                )
+                return config / (
+                    "opencode.jsonc"
+                    if (config / "opencode.jsonc").exists()
+                    else "opencode.json"
+                )
+
+            return data, location("OPENCODE_CONFIG", default_config)
+        variable, relative = {
+            "claude": ("CLAUDE_CONFIG_DIR", ".claude"),
+            "codex": ("CODEX_HOME", ".codex"),
+            "pi": ("PI_CODING_AGENT_DIR", ".pi/agent"),
+            "copilot": ("COPILOT_HOME", ".copilot"),
         }[agent]
-        return location(variable, fallback), None
+        return location(variable, lambda: Path.home() / relative), None
 
 
     def safe_path(path):
@@ -1716,10 +1734,12 @@ vars:
                     )
                     if command["adapter"] == "opencode-v2":
                         private_write(backup, b"")
-                        with sqlite3.connect(
-                            target.as_uri() + "?mode=ro", uri=True
+                        # A SQLite transaction context does not close its connection.
+                        # Close both handles explicitly, including on backup failures.
+                        with closing(
+                            sqlite3.connect(target.as_uri() + "?mode=ro", uri=True)
                         ) as source:
-                            with sqlite3.connect(backup) as destination:
+                            with closing(sqlite3.connect(backup)) as destination:
                                 source.backup(destination)
                     else:
                         private_write(backup, target.read_bytes())
