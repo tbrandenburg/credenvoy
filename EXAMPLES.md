@@ -6,7 +6,7 @@ Every token, account and model ID below is synthetic and unusable. Examples are 
 
 Run `task examples` to print this walkthrough, `task examples:write` to refresh it, and `task examples:check` to detect drift. CI checks this document separately from the portable Taskfile-only tests.
 
-These `generated/` paths describe optional isolated `task generate`/`task run` sessions. For ordinary CLI launches, run `task install:plan` then `task install`: the same profiles and source inputs are compiled directly into native user locations. For example, OpenCode V1 receives `~/.local/share/opencode/auth.json`, Codex receives `~/.codex/auth.json`, and Pi receives `~/.pi/agent/auth.json`. See the README for overrides, supported installation routes and backups.
+These `generated/` paths describe optional isolated `task generate`/`task run` sessions. For ordinary CLI launches, run `task install:plan` then `task install` (profiles are optional; installed agents and credentials can be discovered): the same profiles and source inputs are compiled directly into native user locations. For example, OpenCode V1 receives `~/.local/share/opencode/auth.json`, Codex receives `~/.codex/auth.json`, and Pi receives `~/.pi/agent/auth.json`. See the README for overrides, supported installation routes and backups.
 
 Source inputs are shown decoded for readability. Object/array values must be JSON-serialized into their named environment variable in real use; scalar values are environment-variable strings. Never use these synthetic values for a live login.
 

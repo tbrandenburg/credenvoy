@@ -49,6 +49,7 @@ jobs:
           import pathlib
           import shutil
           import subprocess
+          import sys
           import tempfile
 
           with tempfile.TemporaryDirectory() as temporary:
@@ -88,6 +89,38 @@ jobs:
               auth = json.loads((native_home / 'auth.json').read_text(encoding='utf-8'))
               assert auth['groq']['key'] == 'SYNTHETIC-CI-KEY'
               assert not (root / 'generated').exists()
+
+              # Discover a synthetic Pi executable on PATH without running an agent.
+              shim = root / 'agent-bin'
+              shim.mkdir()
+              executable = shim / ('pi.cmd' if os.name == 'nt' else 'pi')
+              executable.write_text('@exit /b 0\n' if os.name == 'nt' else '#!/bin/sh\nexit 0\n', encoding='utf-8')
+              executable.chmod(0o700)
+              task_executable = shutil.which('task')
+              minimal = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'PATHEXT') if key in os.environ}
+              minimal.update(PATH=str(shim), PYTHON=sys.executable, PYTHONUTF8='1', GROQ_API_KEY='SYNTHETIC-DISCOVERY-KEY')
+              for label, selectors in (
+                  ('automatic', []),
+                  ('parameters', ['AGENTS=pi', 'PROVIDER=groq', 'AUTH=api_key', 'MODEL=literal $(touch SHOULD_NOT_EXIST)']),
+                  ('template', ['AGENTS=pi', 'TEMPLATE=groq-api']),
+              ):
+                  destination = root.resolve() / label
+                  environment = {**minimal, 'PI_CODING_AGENT_DIR': str(destination)}
+                  for action in ('install:plan', 'install'):
+                      result = subprocess.run(
+                          [task_executable, action, "PYTHON=" + sys.executable, *selectors], cwd=root, env=environment,
+                          check=True, capture_output=True, text=True,
+                      )
+                      assert 'SYNTHETIC-DISCOVERY-KEY' not in result.stdout + result.stderr
+                      if action == 'install:plan':
+                          assert not destination.exists()
+                  auth = json.loads((destination / 'auth.json').read_text(encoding='utf-8'))
+                  assert auth['groq']['key'] == 'SYNTHETIC-DISCOVERY-KEY'
+                  if label == 'parameters':
+                      settings = json.loads((destination / 'settings.json').read_text(encoding='utf-8'))
+                      assert settings['defaultModel'] == 'literal $(touch SHOULD_NOT_EXIST)'
+                  assert not (root / 'SHOULD_NOT_EXIST').exists()
+              assert not (root / 'profiles.json').exists()
 
       - name: Check generated examples for drift
         run: task examples:check

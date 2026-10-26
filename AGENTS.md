@@ -6,7 +6,7 @@ Credenvoy is a self-contained collection of go-task Taskfiles that runs a Python
 
 - `Taskfile.yml`: public command names and orchestration. Keep it small.
 - `tasks/runtime.yml`: readable Python literal blocks named `RENDERER_SOURCE`, `COMPILER_SOURCE`, `LAUNCHER_SOURCE`, `INSTALLER_SOURCE`, and `BOOTSTRAP_SOURCE`. The private `_dispatch` task assembles modules in memory.
-- `tasks/catalog.yml`: versioned provider registry, known env names, and examples. Keep provider IDs, protocols, auth modes, aliases, and source links explicit.
+- `tasks/catalog.yml`: versioned provider registry, known env names, profile examples, and native-install selector templates. Keep provider IDs, protocols, auth modes, aliases, and source links explicit.
 - `tasks/tests.yml`: readable Python test blocks. Tests execute in the same in-memory module namespace as the runtime.
 - `README.md`: user guide and honest support claims.
 - `EXAMPLES.md`: generated Markdown walkthrough; refresh with `task examples:write`, check with `task examples:check`. Synthetic inputs stay embedded in `CATALOG_SHOWCASE`; no native credential files are committed.
@@ -19,7 +19,8 @@ There is intentionally no `src/` package, external JSON registry, fixture direct
 Requires Python 3.11+ and Task 3.54+:
 
 ```sh
-task install:plan      # preview native user paths; implementation work must use synthetic homes
+task install:plan      # preview native routes/paths; discovery may probe OpenCode version
+task templates         # list credential-free native-install selectors
 task check             # syntax/invariants, all tests, offline generation smoke
 task test              # focused test suite
 task lint              # embedded runtime syntax and registry invariants
@@ -36,7 +37,7 @@ Use `PYTHON=python3` when needed. Validate from a temporary copy containing only
 
 1. Read the relevant YAML literal block before changing it. Maintain YAML indentation and standard Python formatting; do not minify the code or hide it in base64.
 2. Keep the runtime Python-only and standard-library-only. Tests must not import a local package or read a companion fixture from the repository.
-3. `RENDERER_SOURCE` owns JSON/TOML serialization and private staging. `COMPILER_SOURCE` owns profile validation and route selection. `LAUNCHER_SOURCE` owns environment isolation and bootstrap. `INSTALLER_SOURCE` owns explicit native installation, destination resolution, merge/replace rules, backups and command-based login/import. `BOOTSTRAP_SOURCE` owns module assembly and command dispatch.
+3. `RENDERER_SOURCE` owns JSON/TOML serialization and private staging. `COMPILER_SOURCE` owns profile validation and route selection. `LAUNCHER_SOURCE` owns environment isolation and bootstrap. `INSTALLER_SOURCE` owns profile-free discovery, selector/template precedence, and explicit native installation, destination resolution, merge/replace rules, backups and command-based login/import. `BOOTSTRAP_SOURCE` owns module assembly and command dispatch.
 4. The dispatcher injects public catalog data into module globals. It does not inject credential values into Python source. Secrets are resolved from the process environment by the running compiler.
 5. Preserve UTF-8 output and platform-correct paths. Check Unix mode assertions only on Unix; do not imply that chmod sets Windows ACLs.
 6. Keep public error text free of credential values. Catch failures without echoing raw input JSON, subprocess output, or environment dumps.
@@ -60,6 +61,7 @@ If you temporarily extract code for formatting, keep extraction output outside t
 - Never commit `.env`, `profiles.json`, generated auth/config files, exports, logs, or live credentials. Keep `.gitignore` aligned with new output paths.
 - API keys, upstream OAuth credentials, inference session tokens, bearer tokens, and native auth bundles are separate types. Do not silently replace a subscription route with API billing.
 - Native bundles preserve unknown fields. Token translation must preserve known issuer/client provenance, method, account metadata, and genuine expiry; it cannot create scopes or change token authority.
+- Discovery must use registry credential mappings and installed executable detection. Preserve model/default selections when no model is selected. Reject ambiguous billing/account/provider-product choices before writes. Never infer gateways, legacy token conversions, or cloud-service intent from generic identity variables. Test discovery with mocked executables or a synthetic PATH; never use developer logins as fixture inputs.
 - Installation is explicitly authorized to replace selected native credentials. Test it only against temporary homes and mocked native commands; never invoke install against the developer home during implementation. Preserve unrelated providers/settings, back up originals privately, suppress third-party output, and fail before writes on unsupported persistent mappings.
 - Do not overwrite refreshed credentials during routine launches. Bootstrap is distinct from rotation and cross-machine synchronization.
 - Keep new output directories private, refuse overwrites, and avoid shared servers/databases during bootstrap. Atomic writes alone do not coordinate with an external CLI's token refresh lock.

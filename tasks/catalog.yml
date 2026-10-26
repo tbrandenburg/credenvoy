@@ -1025,6 +1025,30 @@ vars:
         "note": "In this examined V1 bootstrap shape, `refresh` and `access` initially contain the same upstream GitHub OAuth token and `expires` is zero. That upstream token is distinct from a short-lived Copilot inference session token. The synthetic value is not a usable credential."
       }
     ]
+  CATALOG_INSTALL_TEMPLATES: |-
+    {
+      "codex-chatgpt": {
+        "agents": "codex",
+        "provider": "openai-chatgpt",
+        "auth": "subscription"
+      },
+      "claude-subscription": {
+        "agents": "claude",
+        "provider": "anthropic-subscription",
+        "auth": "subscription"
+      },
+      "openai-api": {
+        "provider": "openai",
+        "auth": "api_key"
+      },
+      "groq-api": {
+        "provider": "groq",
+        "auth": "api_key"
+      },
+      "github-copilot": {
+        "provider": "github-copilot"
+      }
+    }
 tasks:
   _dispatch:
     internal: true
@@ -1041,4 +1065,11 @@ tasks:
         TEST_LAUNCHER: '{{if eq .ACTION "test"}}{{.TEST_LAUNCHER}}{{end}}'
         TEST_INSTALLER: '{{if eq .ACTION "test"}}{{.TEST_INSTALLER}}{{end}}'
         SHOWCASE: '{{.CATALOG_SHOWCASE}}'
+        INSTALL_TEMPLATES: '{{.CATALOG_INSTALL_TEMPLATES}}'
+        SELECTION_AGENTS: '{{.SELECTION_AGENTS | default ""}}'
+        SELECTION_PROVIDER: '{{.SELECTION_PROVIDER | default ""}}'
+        SELECTION_AUTH: '{{.SELECTION_AUTH | default ""}}'
+        SELECTION_MODEL: '{{.SELECTION_MODEL | default ""}}'
+        SELECTION_TEMPLATE: '{{.SELECTION_TEMPLATE | default ""}}'
+        SELECTION_SPEC: '{{.SELECTION_SPEC | default ""}}'
 

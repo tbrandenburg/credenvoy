@@ -1,6 +1,5 @@
 version: '3'
 vars:
-  PYTHON: python
   RENDERER_SOURCE: |
     #!/usr/bin/env python3
     """Reference env-to-config renderer. Stages artifacts only; never edits live CLI state."""
@@ -718,7 +717,10 @@ vars:
             "name": req.get("name", a + "-" + pid + "-" + auth),
             "agent": a,
             "provider": p.get("pi_id", pid) if a == "pi" else p.get("opencode_id", pid),
-            "model": model_for(req),
+            "model": None
+            if req.get("auth_only") is True
+            and not (req.get("model") or req.get("model_env"))
+            else model_for(req),
             "env": {},
             "env_values": {},
         }
@@ -971,6 +973,8 @@ vars:
                         if a.startswith("opencode")
                         else "CLOUDFLARE_API_KEY"
                     ] = source
+        if req.get("auth_only") is True:
+            profile["auth_only"] = True
         if a == "opencode-v2":
             profile["credential_id"] = req.get(
                 "credential_id", "cred_generated_" + token(profile["name"]).lower()
@@ -1011,7 +1015,7 @@ vars:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("action", choices=["matrix", "plan", "generate"])
         parser.add_argument(
-            "--spec", default=os.environ.get("AGENTCFG_SPEC", "profiles.json")
+            "--spec", default=os.environ.get("AGENTCFG_SPEC") or "profiles.json"
         )
         parser.add_argument("--out", default=os.environ.get("AGENTCFG_OUTPUT", "generated"))
         args = parser.parse_args(argv)
@@ -1294,6 +1298,295 @@ vars:
         """Public, credential-free installation diagnostic."""
 
 
+    class PersistentRouteError(InstallError):
+        """A generation route has no implemented persistent native mapping."""
+
+
+    # Native discovery uses the same registry, compiler and installer as explicit specs.
+    # It never reads login caches as credential inputs or creates gateway/token conversions.
+    EXECUTABLES = {"claude": "claude", "codex": "codex", "pi": "pi", "copilot": "copilot"}
+    NATIVE_SOURCES = {
+        ("chatgpt", "codex"): "CODEX_AUTH_JSON",
+        ("chatgpt", "opencode-v1"): "OPENCODE_V1_OPENAI_OAUTH_JSON",
+        ("chatgpt", "opencode-v2"): "OPENCODE_OPENAI_AUTH_EXPORT_JSON",
+        ("chatgpt", "pi"): "PI_OPENAI_CODEX_OAUTH_JSON",
+        ("claude-subscription", "claude"): "CLAUDE_AUTH_JSON",
+    }
+    TEMPLATES = globals()["CREDENVOY_INSTALL_TEMPLATES"]
+
+
+    def opencode_adapter(executable):
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        match = re.search(r"\b(\d+)\.\d+\.\d+\b", result.stdout)
+        if not match or match[1] not in ("1", "2"):
+            raise InstallError(
+                "Cannot identify a supported OpenCode major version; use AGENTS=opencode-v1 or opencode-v2"
+            )
+        return "opencode-v" + match[1]
+
+
+    def select_agents(selection):
+        if selection:
+            agents = []
+            for agent in selection.split(","):
+                agent = agent.strip()
+                if agent == "opencode":
+                    executable = shutil.which("opencode")
+                    if not executable:
+                        raise InstallError(
+                            "OpenCode is not on PATH; select an explicit major version with AGENTS"
+                        )
+                    agent = opencode_adapter(executable)
+                if agent not in compiler.AGENTS:
+                    raise InstallError(
+                        "Unknown AGENTS selection; choose claude, codex, pi, copilot, opencode, opencode-v1 or opencode-v2"
+                    )
+                if agent not in agents:
+                    agents.append(agent)
+        else:
+            agents = [
+                agent
+                for agent, executable in EXECUTABLES.items()
+                if shutil.which(executable)
+            ]
+            executable = shutil.which("opencode")
+            if executable:
+                agents.append(opencode_adapter(executable))
+        if not agents:
+            raise InstallError(
+                "No supported agents found on PATH; install a CLI or select AGENTS explicitly"
+            )
+        if "opencode-v1" in agents and "opencode-v2" in agents:
+            raise InstallError("Choose one OpenCode major version per installation")
+        return agents
+
+
+    def credential_source(agent, pid, auth, provider, explicit_provider):
+        kind = provider["kind"]
+        if kind in ("chatgpt", "claude-subscription"):
+            name = NATIVE_SOURCES.get((kind, agent))
+            return name if name and os.environ.get(name) else None
+        if kind == "copilot":
+            name = (
+                "GITHUB_COPILOT_OAUTH_TOKEN" if auth == "oauth" else "COPILOT_GITHUB_TOKEN"
+            )
+            return name if os.environ.get(name) else None
+        if auth == "api_key":
+            request = {"agent": agent, "provider": pid}
+            override = (
+                "AGENTCFG_" + compiler.token(agent) + "_" + compiler.token(pid) + "_API_KEY"
+            )
+            names = [override, provider.get("key_env"), *provider.get("aliases", [])]
+            if any(name and os.environ.get(name) for name in names):
+                try:
+                    return compiler.key_source(request, provider)
+                except compiler.ConfigError:
+                    raise InstallError(
+                        "Conflicting credential aliases for "
+                        + agent
+                        + "/"
+                        + pid
+                        + "; export one consistent value"
+                    ) from None
+        if kind == "aws" and auth == "bearer":
+            return (
+                "AWS_BEARER_TOKEN_BEDROCK"
+                if os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
+                else None
+            )
+        if kind == "foundry" and auth == "bearer":
+            return (
+                "ANTHROPIC_FOUNDRY_AUTH_TOKEN"
+                if os.environ.get("ANTHROPIC_FOUNDRY_AUTH_TOKEN")
+                else None
+            )
+        if kind == "local":
+            name = provider["base_url_env"]
+            return name if os.environ.get(name) else None
+        # Generic cloud identity variables do not express an intent to use a model service.
+        if auth == "ambient" and explicit_provider:
+            return "ambient"
+        return None
+
+
+    def discover(agents, provider=None, auth=None, model=None):
+        if provider and provider not in compiler.PROVIDERS:
+            raise InstallError(
+                "Unknown PROVIDER; inspect task matrix for supported provider IDs"
+            )
+        if auth and auth not in {
+            mode for p in compiler.PROVIDERS.values() for mode in p["auth_modes"]
+        }:
+            raise InstallError(
+                "Unknown AUTH; inspect task matrix for supported authentication modes"
+            )
+        accepted, notes = [], []
+        for agent in select_agents(agents):
+            count = 0
+            for pid, entry in compiler.PROVIDERS.items():
+                if provider and pid != provider:
+                    continue
+                for mode in entry["auth_modes"]:
+                    if auth and mode != auth:
+                        continue
+                    source = credential_source(agent, pid, mode, entry, bool(provider))
+                    if not source:
+                        continue
+                    label = agent + "/" + pid + "/" + mode
+                    route = compiler.route(agent, pid, mode)
+                    if route.startswith("unsupported") or route == "gateway-required":
+                        notes.append(
+                            "Skipped "
+                            + label
+                            + ": requires an explicit supported profile/gateway"
+                        )
+                        continue
+                    if mode == "api_key" and not provider:
+                        products = [
+                            candidate
+                            for candidate, details in compiler.PROVIDERS.items()
+                            if source
+                            in [details.get("key_env"), *details.get("aliases", [])]
+                            and "api_key" in details["auth_modes"]
+                            and compiler.route(agent, candidate, "api_key")
+                            not in (
+                                "unsupported-native",
+                                "unsupported-auth",
+                                "gateway-required",
+                            )
+                        ]
+                        if len(products) > 1:
+                            raise InstallError(
+                                "A credential variable matches multiple provider products for "
+                                + agent
+                                + "; select PROVIDER explicitly"
+                            )
+                    request = {
+                        "name": "auto-" + agent + "-" + pid + "-" + mode,
+                        "agent": agent,
+                        "provider": pid,
+                        "auth": mode,
+                        "auth_only": True,
+                    }
+                    if model:
+                        request["model"] = model
+                    try:
+                        compiled = compiler.compile_profile(request)
+                        # Probe persistence without applying: unsupported native mappings
+                        # must not masquerade as installable generation routes.
+                        Installation().add(compiled)
+                    except PersistentRouteError:
+                        notes.append(
+                            "Skipped "
+                            + label
+                            + ": native persistence is not implemented; use task run"
+                        )
+                        continue
+                    except (compiler.ConfigError, ValueError, KeyError, TypeError) as error:
+                        if isinstance(error, InstallError):
+                            raise
+                        if provider or entry["kind"] in (
+                            "chatgpt",
+                            "claude-subscription",
+                            "copilot",
+                        ):
+                            raise InstallError(
+                                "Cannot configure "
+                                + label
+                                + "; check credential format, endpoint/cloud inputs and MODEL requirements"
+                            ) from None
+                        notes.append(
+                            "Skipped "
+                            + label
+                            + ": missing or invalid native credential/model/endpoint inputs"
+                        )
+                        continue
+                    accepted.append((request, compiled, source))
+                    count += 1
+            if not count:
+                notes.append(
+                    "Skipped "
+                    + agent
+                    + ": no compatible, complete native credentials selected"
+                )
+        # Only compatible native candidates participate in ambiguity checks.
+        for agent in {p[0]["agent"] for p in accepted}:
+            candidates = [p for p in accepted if p[0]["agent"] == agent]
+            if agent in ("claude", "codex", "copilot") and len(candidates) > 1:
+                raise InstallError(
+                    "Ambiguous credentials for "
+                    + agent
+                    + "; select PROVIDER and, when necessary, AUTH before installing"
+                )
+            slots, sources = {}, {}
+            for request, compiled, source in candidates:
+                slots.setdefault(compiled["provider"], []).append(request)
+                sources.setdefault(source, set()).add(request["provider"])
+            if any(len(providers) > 1 for providers in sources.values()):
+                raise InstallError(
+                    "A credential variable matches multiple provider products for "
+                    + agent
+                    + "; select PROVIDER explicitly"
+                )
+            if any(len(entries) > 1 for entries in slots.values()):
+                raise InstallError(
+                    "Ambiguous auth methods for "
+                    + agent
+                    + "; select PROVIDER and AUTH before installing"
+                )
+        if not accepted:
+            raise InstallError(
+                "No installable credentials found. Export supported credentials and check AGENTS/PROVIDER/AUTH and MODEL when required. "
+                + " ".join(notes)
+            )
+        notes.extend(
+            "Selected " + p[0]["agent"] + "/" + p[0]["provider"] + "/" + p[0]["auth"]
+            for p in accepted
+        )
+        return {"profiles": [p[0] for p in accepted]}, notes
+
+
+    def resolve_inputs(args):
+        selected = any((args.agents, args.provider, args.auth, args.model, args.template))
+        explicit_spec = args.spec or os.environ.get("AGENT_CONFIG_SPEC")
+        if selected and explicit_spec:
+            raise InstallError(
+                "Choose direct selectors/templates or an explicit specification, not both"
+            )
+        if selected:
+            if args.profile:
+                raise InstallError(
+                    "AGENTCFG_PROFILE selects a named specification profile; use AGENTS/PROVIDER/AUTH for discovery"
+                )
+            defaults = {}
+            if args.template:
+                if args.template not in TEMPLATES:
+                    raise InstallError(
+                        "Unknown TEMPLATE; run task templates for available names"
+                    )
+                defaults = TEMPLATES[args.template]
+            return discover(
+                args.agents or defaults.get("agents"),
+                args.provider or defaults.get("provider"),
+                args.auth or defaults.get("auth"),
+                args.model,
+            )
+        path = args.spec or "profiles.json"
+        if explicit_spec or Path(path).exists():
+            return compiler.load_spec(path), []
+        if args.profile:
+            raise InstallError(
+                "AGENTCFG_PROFILE requires a specification containing that profile"
+            )
+        return discover(None)
+
+
     def location(variable, fallback):
         try:
             value = os.environ.get(variable)
@@ -1456,6 +1749,10 @@ vars:
                 raise InstallError("Choose one OpenCode major version per installation")
             self.adapters.add(agent)
             data, config = destinations(agent)
+            if agent == "copilot" and profile.get("base_url"):
+                raise PersistentRouteError(
+                    "Copilot BYOK currently needs task run; native providers.json installation is not yet implemented"
+                )
             files = renderer.render(profile)
             runtime = files.pop("runtime.json")
             values = {
@@ -1480,7 +1777,7 @@ vars:
                     if entry is None:
                         entry = auth[provider] = {"type": "api_key"}
                     if entry["type"] != "api_key":
-                        raise InstallError(
+                        raise PersistentRouteError(
                             "Pi OAuth plus extra environment needs isolated task run"
                         )
                     entry["env"] = {**entry.get("env", {}), **values}
@@ -1508,7 +1805,7 @@ vars:
                 else:
                     parsed.setdefault("model_provider", "openai")
                 if set(values) - consumed - {profile.get("api_key_env")}:
-                    raise InstallError(
+                    raise PersistentRouteError(
                         "Codex cloud/environment-only configuration needs isolated task run"
                     )
                 if "auth.json" in files:
@@ -1516,17 +1813,14 @@ vars:
                     parsed["forced_login_method"] = (
                         "api" if profile.get("native_api_key") else "chatgpt"
                     )
-                # Clear a previous configured default profile which would mask this selection.
-                self.update(
-                    data / "config.toml",
-                    parsed,
-                    remove_keys=(
-                        "profile",
-                        "forced_login_method",
-                        "openai_base_url",
-                        "chatgpt_base_url",
-                    ),
-                )
+                # Discovery authenticates without selecting a new model/provider default.
+                auth_only = profile.get("auth_only") and not profile.get("model")
+                if auth_only:
+                    parsed.pop("model_provider", None)
+                remove = ("forced_login_method", "openai_base_url", "chatgpt_base_url")
+                if not auth_only:
+                    remove += ("profile",)
+                self.update(data / "config.toml", parsed, remove_keys=remove)
                 if custom is not None:
                     # Replace this managed provider atomically, excluding stale env/auth fields.
                     current = self.files[data / "config.toml"]["value"]
@@ -1541,8 +1835,13 @@ vars:
                 if not isinstance(old_env, dict):
                     raise InstallError("Claude settings.env must be an object")
                 for key in list(old_env):
-                    if key in launcher.RESET and (
-                        key.startswith("ANTHROPIC_") or key.startswith("CLAUDE_CODE_USE_")
+                    if (
+                        key != "ANTHROPIC_MODEL"
+                        and key in launcher.RESET
+                        and (
+                            key.startswith("ANTHROPIC_")
+                            or key.startswith("CLAUDE_CODE_USE_")
+                        )
                     ):
                         old_env.pop(key)
                 for filename, value in files.items():
@@ -1556,7 +1855,7 @@ vars:
                 token = values.pop("COPILOT_GITHUB_TOKEN", None)
                 model = values.pop("COPILOT_MODEL", None)
                 if values:
-                    raise InstallError(
+                    raise PersistentRouteError(
                         "Copilot BYOK currently needs task run; native providers.json installation is not yet implemented"
                     )
                 if model:
@@ -1579,7 +1878,7 @@ vars:
                     entry = files["opencode.json"]["providers"][provider]
                     entry.pop("env", None)
                 if set(values) - {profile.get("api_key_env")}:
-                    raise InstallError(
+                    raise PersistentRouteError(
                         "OpenCode cloud/environment-only configuration needs isolated task run"
                     )
                 if "auth.json" in files:
@@ -1618,7 +1917,7 @@ vars:
                     )
                     + str(command["target"])
                 )
-            print("Plan only. No files written or CLI commands executed.")
+            print("Plan only. No files written or authentication commands executed.")
 
 
     def private_write(path, content):
@@ -1785,13 +2084,20 @@ vars:
 
     def main(argv=None, dry_run=False):
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument(
-            "--spec", default=os.environ.get("AGENTCFG_SPEC", "profiles.json")
-        )
+        parser.add_argument("--spec", default=os.environ.get("AGENTCFG_SPEC") or None)
         parser.add_argument("--profile", default=os.environ.get("AGENTCFG_PROFILE"))
+        parser.add_argument("--agents", default=os.environ.get("AGENTCFG_AGENTS") or None)
+        parser.add_argument(
+            "--provider", default=os.environ.get("AGENTCFG_PROVIDER") or None
+        )
+        parser.add_argument("--auth", default=os.environ.get("AGENTCFG_AUTH") or None)
+        parser.add_argument("--model", default=os.environ.get("AGENTCFG_MODEL") or None)
+        parser.add_argument(
+            "--template", default=os.environ.get("AGENTCFG_TEMPLATE") or None
+        )
         args = parser.parse_args(argv)
         try:
-            raw = compiler.load_spec(args.spec)
+            raw, notes = resolve_inputs(args)
             if args.profile:
                 raw = {
                     **raw,
@@ -1809,6 +2115,8 @@ vars:
                 raise InstallError(
                     "Selected profiles have no persistent authentication/configuration to install"
                 )
+            for note in notes:
+                print(note)
             if dry_run:
                 plan.describe()
             else:
@@ -1886,7 +2194,11 @@ vars:
         _PAYLOAD["sources"]["launcher"],
         {"CREDENVOY_ENV_NAMES": _PAYLOAD["env_names"]},
     )
-    installer = load_module("credenvoy.installer", _PAYLOAD["sources"]["installer"])
+    installer = load_module(
+        "credenvoy.installer",
+        _PAYLOAD["sources"]["installer"],
+        {"CREDENVOY_INSTALL_TEMPLATES": _PAYLOAD["install_templates"]},
+    )
     runtime = types.ModuleType("credenvoy.runtime")
     runtime.EXAMPLES = EXAMPLES
     runtime.engine_program = engine_program
@@ -1930,7 +2242,8 @@ vars:
             "CI checks this document separately from the portable Taskfile-only tests.",
             "",
             "These `generated/` paths describe optional isolated `task generate`/`task run` "
-            "sessions. For ordinary CLI launches, run `task install:plan` then `task install`: "
+            "sessions. For ordinary CLI launches, run `task install:plan` then `task install` "
+            "(profiles are optional; installed agents and credentials can be discovered): "
             "the same profiles and source inputs are compiled directly into native user locations. "
             "For example, OpenCode V1 receives `~/.local/share/opencode/auth.json`, Codex "
             "receives `~/.codex/auth.json`, and Pi receives `~/.pi/agent/auth.json`. "
@@ -2041,7 +2354,7 @@ vars:
         if not args or args[0] in ("help", "--help", "-h"):
             print(
                 "Credenvoy " + VERSION + " — your credentials, delivered to every agent.\n"
-                "Commands: matrix, matrix:markdown, example, examples, examples:write, examples:check, init, validate, plan, generate, install:plan, install, run, lint, test, smoke, export\n"
+                "Commands: matrix, matrix:markdown, example, examples, examples:write, examples:check, init, validate, plan, generate, install:plan, install, templates, run, lint, test, smoke, export\n"
                 "Selection: AGENTCFG_SPEC, AGENTCFG_OUTPUT, AGENTCFG_PROFILE, AGENTCFG_EXAMPLE"
             )
             return
@@ -2052,6 +2365,8 @@ vars:
             compiler.main(["plan" if action == "validate" else action, *tail])
         elif action in ("install", "install:plan"):
             installer.main(tail, dry_run=action == "install:plan")
+        elif action == "templates":
+            print(json.dumps(installer.TEMPLATES, indent=2))
         elif action == "run":
             launcher.main(tail)
         elif action == "matrix:markdown":
@@ -2116,9 +2431,16 @@ tasks:
   _dispatch:
     internal: true
     silent: true
+    env:
+      AGENTCFG_AGENTS: '{{.SELECTION_AGENTS | default .AGENTCFG_AGENTS | default ""}}'
+      AGENTCFG_PROVIDER: '{{.SELECTION_PROVIDER | default .AGENTCFG_PROVIDER | default ""}}'
+      AGENTCFG_AUTH: '{{.SELECTION_AUTH | default .AGENTCFG_AUTH | default ""}}'
+      AGENTCFG_MODEL: '{{.SELECTION_MODEL | default .AGENTCFG_MODEL | default ""}}'
+      AGENTCFG_TEMPLATE: '{{.SELECTION_TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+      AGENTCFG_SPEC: '{{.SELECTION_SPEC | default .AGENTCFG_SPEC | default ""}}'
     cmds:
     - |
-      "{{.PYTHON}}" - "{{.ACTION}}" <<'CREDENVOY_PYTHON'
+      "{{.PYTHON | default "python"}}" - "{{.ACTION}}" <<'CREDENVOY_PYTHON'
       import json
       _PAYLOAD = {
           "sources": {
@@ -2139,6 +2461,7 @@ tasks:
           "env_names": json.loads({{.ENV_NAMES | toJson}}),
           "examples": json.loads({{.EXAMPLES | toJson}}),
           "showcase": json.loads({{.SHOWCASE | toJson}}),
+          "install_templates": json.loads({{.INSTALL_TEMPLATES | toJson}}),
       }
       _BOOTSTRAP_SOURCE = {{.BOOTSTRAP_SOURCE | toJson}}
       exec(compile(_BOOTSTRAP_SOURCE, '<credenvoy.runtime>', 'exec'))
