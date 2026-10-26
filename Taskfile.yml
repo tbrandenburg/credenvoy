@@ -78,6 +78,7 @@ tasks:
         SELECTION_AUTH: '{{.AUTH | default .AGENTCFG_AUTH | default ""}}'
         SELECTION_MODEL: '{{.MODEL | default .AGENTCFG_MODEL | default ""}}'
         SELECTION_TEMPLATE: '{{.TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+        SELECTION_FORCE: '{{.FORCE | default .AGENTCFG_FORCE | default "false"}}'
         SELECTION_SPEC: '{{.SPEC | default .AGENTCFG_SPEC | default ""}}'
   install:plan:
     desc: Preview native installation; discovery may probe OpenCode version
@@ -91,6 +92,7 @@ tasks:
         SELECTION_AUTH: '{{.AUTH | default .AGENTCFG_AUTH | default ""}}'
         SELECTION_MODEL: '{{.MODEL | default .AGENTCFG_MODEL | default ""}}'
         SELECTION_TEMPLATE: '{{.TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+        SELECTION_FORCE: '{{.FORCE | default .AGENTCFG_FORCE | default "false"}}'
         SELECTION_SPEC: '{{.SPEC | default .AGENTCFG_SPEC | default ""}}'
   templates:
     desc: List predefined native-install selector templates

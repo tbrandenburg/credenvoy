@@ -1378,22 +1378,11 @@ vars:
             )
             return name if os.environ.get(name) else None
         if auth == "api_key":
-            request = {"agent": agent, "provider": pid}
             override = (
                 "AGENTCFG_" + compiler.token(agent) + "_" + compiler.token(pid) + "_API_KEY"
             )
             names = [override, provider.get("key_env"), *provider.get("aliases", [])]
-            if any(name and os.environ.get(name) for name in names):
-                try:
-                    return compiler.key_source(request, provider)
-                except compiler.ConfigError:
-                    raise InstallError(
-                        "Conflicting credential aliases for "
-                        + agent
-                        + "/"
-                        + pid
-                        + "; export one consistent value"
-                    ) from None
+            return next((name for name in names if name and os.environ.get(name)), None)
         if kind == "aws" and auth == "bearer":
             return (
                 "AWS_BEARER_TOKEN_BEDROCK"
@@ -1413,6 +1402,87 @@ vars:
         if auth == "ambient" and explicit_provider:
             return "ambient"
         return None
+
+
+    AUTH_PREFERENCE = {
+        "subscription": 0,
+        "oauth": 1,
+        "github_token": 2,
+        "bearer": 3,
+        "ambient": 4,
+        "api_key": 5,
+        "keyless": 6,
+    }
+    PLAN_PRODUCTS = {
+        "zai-coding-plan",
+        "opencode-go",
+        "kimi-code-plan-cn",
+        "kimi-code-plan-global",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-sgp",
+    }
+
+
+    def prefer_credentials(records, notes):
+        order = {provider: index for index, provider in enumerate(compiler.PROVIDERS)}
+
+        def rank(record):
+            request = record[0]
+            provider = request["provider"]
+            mode = request.get("auth", compiler.PROVIDERS[provider]["auth_modes"][0])
+            return (
+                AUTH_PREFERENCE[mode],
+                0 if provider in PLAN_PRODUCTS else 1,
+                order[provider],
+                request.get("name", ""),
+            )
+
+        chosen, occupied, shared = [], set(), set()
+        for record in sorted(records, key=rank):
+            request, compiled, source = record
+            agent = request["agent"]
+            kind = compiler.PROVIDERS[request["provider"]]["kind"]
+            family = (
+                "openai"
+                if kind == "chatgpt"
+                else "anthropic"
+                if kind == "claude-subscription"
+                else compiled["provider"]
+            )
+            slot = (
+                agent,
+                "identity" if agent in ("codex", "claude", "copilot") else family,
+            )
+            key = (agent, source) if source else None
+            if slot in occupied or (key is not None and key in shared):
+                notes.append(
+                    "Skipped "
+                    + agent
+                    + "/"
+                    + request["provider"]
+                    + "/"
+                    + request.get("auth", "default")
+                    + ": a higher-priority credential was selected"
+                )
+                continue
+            chosen.append(record)
+            occupied.add(slot)
+            if key is not None:
+                shared.add(key)
+        return chosen
+
+
+    def force_enabled(value):
+        if value is None or value == "":
+            return False
+        if isinstance(value, bool):
+            return value
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        if value.lower() in ("false", "0", "no"):
+            return False
+        raise InstallError("FORCE must be true or false")
 
 
     def discover(agents, provider=None, auth=None, model=None):
@@ -1447,26 +1517,6 @@ vars:
                             + ": requires an explicit supported profile/gateway"
                         )
                         continue
-                    if mode == "api_key" and not provider:
-                        products = [
-                            candidate
-                            for candidate, details in compiler.PROVIDERS.items()
-                            if source
-                            in [details.get("key_env"), *details.get("aliases", [])]
-                            and "api_key" in details["auth_modes"]
-                            and compiler.route(agent, candidate, "api_key")
-                            not in (
-                                "unsupported-native",
-                                "unsupported-auth",
-                                "gateway-required",
-                            )
-                        ]
-                        if len(products) > 1:
-                            raise InstallError(
-                                "A credential variable matches multiple provider products for "
-                                + agent
-                                + "; select PROVIDER explicitly"
-                            )
                     request = {
                         "name": "auto-" + agent + "-" + pid + "-" + mode,
                         "agent": agent,
@@ -1474,13 +1524,15 @@ vars:
                         "auth": mode,
                         "auth_only": True,
                     }
+                    if mode == "api_key":
+                        request["key_env"] = source
                     if model:
                         request["model"] = model
                     try:
                         compiled = compiler.compile_profile(request)
                         # Probe persistence without applying: unsupported native mappings
                         # must not masquerade as installable generation routes.
-                        Installation().add(compiled)
+                        Installation(force=True).add(compiled)
                     except PersistentRouteError:
                         notes.append(
                             "Skipped "
@@ -1515,31 +1567,7 @@ vars:
                     + agent
                     + ": no compatible, complete native credentials selected"
                 )
-        # Only compatible native candidates participate in ambiguity checks.
-        for agent in {p[0]["agent"] for p in accepted}:
-            candidates = [p for p in accepted if p[0]["agent"] == agent]
-            if agent in ("claude", "codex", "copilot") and len(candidates) > 1:
-                raise InstallError(
-                    "Ambiguous credentials for "
-                    + agent
-                    + "; select PROVIDER and, when necessary, AUTH before installing"
-                )
-            slots, sources = {}, {}
-            for request, compiled, source in candidates:
-                slots.setdefault(compiled["provider"], []).append(request)
-                sources.setdefault(source, set()).add(request["provider"])
-            if any(len(providers) > 1 for providers in sources.values()):
-                raise InstallError(
-                    "A credential variable matches multiple provider products for "
-                    + agent
-                    + "; select PROVIDER explicitly"
-                )
-            if any(len(entries) > 1 for entries in slots.values()):
-                raise InstallError(
-                    "Ambiguous auth methods for "
-                    + agent
-                    + "; select PROVIDER and AUTH before installing"
-                )
+        accepted = prefer_credentials(accepted, notes)
         if not accepted:
             raise InstallError(
                 "No installable credentials found. Export supported credentials and check AGENTS/PROVIDER/AUTH and MODEL when required. "
@@ -1641,7 +1669,7 @@ vars:
             raise InstallError("Install target must be a regular file")
 
 
-    def json_object(text):
+    def json_object(text, jsonc=True):
         def pairs(items):
             result = {}
             for key, value in items:
@@ -1652,7 +1680,11 @@ vars:
 
         # Strings are matched first so comment markers and commas inside them survive.
         pattern = r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?\*/|,\s*(?=[}\]])'
-        clean = re.sub(pattern, lambda m: m[0] if m[0].startswith('"') else " ", text)
+        clean = (
+            re.sub(pattern, lambda m: m[0] if m[0].startswith('"') else " ", text)
+            if jsonc
+            else text
+        )
         result = json.loads(clean.lstrip("\ufeff"), object_pairs_hook=pairs)
         if not isinstance(result, dict):
             raise InstallError("Existing configuration must contain a JSON object")
@@ -1708,7 +1740,8 @@ vars:
 
 
     class Installation:
-        def __init__(self):
+        def __init__(self, force=False):
+            self.force = force
             self.files = {}
             self.commands = []
             self.slots = {}
@@ -1718,21 +1751,32 @@ vars:
             safe_path(path)
             if path not in self.files:
                 original = path.read_bytes() if path.exists() else None
+                valid = True
                 try:
                     parsed = (
                         (
                             tomllib.loads(original.decode("utf-8"))
                             if path.suffix == ".toml"
-                            else json_object(original.decode("utf-8"))
+                            else json_object(
+                                original.decode("utf-8"),
+                                jsonc=path.name not in ("auth.json", ".credentials.json"),
+                            )
                         )
                         if original is not None
                         else {}
                     )
                 except (ValueError, UnicodeError):
-                    raise InstallError(
-                        "Existing target is invalid JSON/JSONC/TOML; repair it before installation"
-                    ) from None
-                self.files[path] = {"before": original, "value": parsed}
+                    if not self.force:
+                        raise InstallError(
+                            "Existing target is invalid JSON/JSONC/TOML; FORCE=true is required to replace it"
+                        ) from None
+                    parsed = {}
+                    valid = False
+                self.files[path] = {
+                    "before": original,
+                    "original": copy.deepcopy(parsed) if valid else None,
+                    "value": parsed,
+                }
             entry = self.files[path]
             old = {} if whole else copy.deepcopy(entry["value"])
             for key in (*replace_keys, *remove_keys):
@@ -1898,7 +1942,29 @@ vars:
                 if agent in ("pi", "codex"):
                     self.update(data / filename, value)
 
+        def prepare(self):
+            for path, entry in self.files.items():
+                entry["after"] = (
+                    entry["before"]
+                    if entry["before"] is not None and entry["value"] == entry["original"]
+                    else serialize(entry["value"], path.suffix == ".toml")
+                )
+
+        def overwrites(self):
+            self.prepare()
+            paths = [
+                str(path)
+                for path, entry in self.files.items()
+                if entry["before"] is not None and entry["before"] != entry["after"]
+            ]
+            paths += [str(c["target"]) for c in self.commands if c["target"].exists()]
+            # Copilot delegates to an opaque OS credential store which can already contain a login.
+            if any(c["adapter"] == "copilot" for c in self.commands):
+                paths.append("Copilot native credential store")
+            return list(dict.fromkeys(paths))
+
         def describe(self):
+            self.prepare()
             for path, entry in self.files.items():
                 print(
                     (
@@ -1916,6 +1982,12 @@ vars:
                         else "Additive OpenCode V2 import: "
                     )
                     + str(command["target"])
+                )
+            overwrites = self.overwrites()
+            if overwrites:
+                print(
+                    ("FORCE enabled for: " if self.force else "Requires FORCE=true: ")
+                    + ", ".join(overwrites)
                 )
             print("Plan only. No files written or authentication commands executed.")
 
@@ -1951,7 +2023,7 @@ vars:
             required = "--standalone"
         result = subprocess.run(
             argv,
-            input=None if preflight else command["input"],
+            input="" if preflight else command["input"],
             env=env,
             capture_output=True,
             text=True,
@@ -1964,7 +2036,14 @@ vars:
             )
 
 
-    def apply(plan):
+    def apply(plan, force=None):
+        force = plan.force if force is None else force
+        overwrites = plan.overwrites()
+        if overwrites and not force:
+            raise InstallError(
+                "Existing files or credential stores would be overwritten; rerun with FORCE=true: "
+                + ", ".join(overwrites)
+            )
         # Capability checks happen before any native files change. Suppress third-party
         # output/exceptions because they can echo credential data.
         env = dict(os.environ)
@@ -1988,23 +2067,61 @@ vars:
                     existing = json.loads(result.stdout)
                     if not isinstance(existing, list):
                         raise InstallError("Unexpected OpenCode auth export format")
+                    command["remove"] = []
+                    command["activate"] = []
                     for incoming in json.loads(command["input"]):
                         matches = [
-                            entry
-                            for entry in existing
-                            if entry.get("id") == incoming["id"]
-                            or entry.get("integrationID") == incoming["integrationID"]
+                            entry for entry in existing if entry.get("id") == incoming["id"]
                         ]
-                        if matches and not any(
+                        for entry in matches:
+                            if (
+                                entry.get("value") != incoming["value"]
+                                or entry.get("integrationID") != incoming["integrationID"]
+                            ):
+                                command["remove"].append(
+                                    (entry["integrationID"], entry["id"])
+                                )
+                        if incoming["active"] and not any(
                             entry.get("id") == incoming["id"]
-                            and entry.get("integrationID") == incoming["integrationID"]
+                            and entry.get("active")
                             and entry.get("value") == incoming["value"]
-                            and (not incoming["active"] or entry.get("active"))
                             for entry in matches
                         ):
-                            raise InstallError(
-                                "OpenCode V2 already has a different credential/selection; use its native auth commands to remove/select it before reinstalling"
+                            command["activate"].append(
+                                (incoming["integrationID"], incoming["id"])
                             )
+                    for operation, entries in (
+                        ("logout", command["remove"]),
+                        ("switch", command["activate"]),
+                    ):
+                        if entries:
+                            help_result = subprocess.run(
+                                ["opencode", "auth", operation, "--help"],
+                                env=env,
+                                input="",
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                                timeout=120,
+                            )
+                            if (
+                                "--standalone"
+                                not in help_result.stdout + help_result.stderr
+                                or "credential"
+                                not in help_result.stdout + help_result.stderr
+                            ):
+                                raise InstallError(
+                                    "Installed OpenCode lacks noninteractive standalone auth replacement/switch support"
+                                )
+                            for identifiers in entries:
+                                if not all(
+                                    isinstance(value, str)
+                                    and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", value)
+                                    for value in identifiers
+                                ):
+                                    raise InstallError(
+                                        "Invalid native credential identifier for noninteractive replacement"
+                                    )
         backups = []
         changed = []
         try:
@@ -2055,7 +2172,41 @@ vars:
                     private_write(path, entry["after"])
                     changed.append(path)
             for command in plan.commands:
+                for integration, credential in command.get("remove", []):
+                    subprocess.run(
+                        [
+                            "opencode",
+                            "auth",
+                            "logout",
+                            integration,
+                            credential,
+                            "--standalone",
+                        ],
+                        env=env,
+                        input="",
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=120,
+                    )
                 native_command(command, env)
+                for integration, credential in command.get("activate", []):
+                    subprocess.run(
+                        [
+                            "opencode",
+                            "auth",
+                            "switch",
+                            integration,
+                            credential,
+                            "--standalone",
+                        ],
+                        env=env,
+                        input="",
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=120,
+                    )
         except BaseException:
             for path in reversed(changed):
                 entry = plan.files[path]
@@ -2073,7 +2224,7 @@ vars:
             print("Backup: " + str(path))
         if any(c["adapter"] == "opencode-v2" for c in plan.commands):
             print(
-                "OpenCode V2 import completed: additive only; existing IDs and active selections are preserved, not rotated."
+                "OpenCode V2 credentials installed; forced replacements and account selections use native standalone commands."
             )
         if any(c["adapter"] == "copilot" for c in plan.commands):
             print("Copilot native login completed; the CLI manages keychain/file storage.")
@@ -2095,8 +2246,14 @@ vars:
         parser.add_argument(
             "--template", default=os.environ.get("AGENTCFG_TEMPLATE") or None
         )
+        parser.add_argument("--force", action="store_true", default=None)
         args = parser.parse_args(argv)
         try:
+            force = (
+                args.force
+                if args.force is not None
+                else force_enabled(os.environ.get("AGENTCFG_FORCE"))
+            )
             raw, notes = resolve_inputs(args)
             if args.profile:
                 raw = {
@@ -2108,8 +2265,19 @@ vars:
                 if not raw["profiles"]:
                     raise InstallError("Selected AGENTCFG_PROFILE does not exist")
             spec = compiler.compile_spec(raw)
-            plan = Installation()
-            for profile in spec["profiles"]:
+            records = []
+            for request, profile in zip(raw["profiles"], spec["profiles"]):
+                source = (
+                    profile.get("api_key_env")
+                    or profile.get("native_auth_json_env")
+                    or profile.get("oauth_json_env")
+                    or profile.get("auth_export_json_env")
+                    or profile.get("github_oauth_env")
+                )
+                records.append((request, profile, source))
+            selected = prefer_credentials(records, notes)
+            plan = Installation(force=force)
+            for _, profile, _ in selected:
                 plan.add(profile)
             if not plan.files and not plan.commands:
                 raise InstallError(
@@ -2247,7 +2415,8 @@ vars:
             "the same profiles and source inputs are compiled directly into native user locations. "
             "For example, OpenCode V1 receives `~/.local/share/opencode/auth.json`, Codex "
             "receives `~/.codex/auth.json`, and Pi receives `~/.pi/agent/auth.json`. "
-            "See the README for overrides, supported installation routes and backups.",
+            "Use `task install FORCE=true` to authorize changes to existing native files/stores. "
+            "See the README for subscription-first selection, overrides, installation routes and backups.",
             "",
             "Source inputs are shown decoded for readability. Object/array values "
             "must be JSON-serialized into their named environment variable in real use; "
@@ -2437,6 +2606,7 @@ tasks:
       AGENTCFG_AUTH: '{{.SELECTION_AUTH | default .AGENTCFG_AUTH | default ""}}'
       AGENTCFG_MODEL: '{{.SELECTION_MODEL | default .AGENTCFG_MODEL | default ""}}'
       AGENTCFG_TEMPLATE: '{{.SELECTION_TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+      AGENTCFG_FORCE: '{{.SELECTION_FORCE | default .AGENTCFG_FORCE | default "false"}}'
       AGENTCFG_SPEC: '{{.SELECTION_SPEC | default .AGENTCFG_SPEC | default ""}}'
     cmds:
     - |

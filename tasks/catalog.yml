@@ -1071,5 +1071,6 @@ tasks:
         SELECTION_AUTH: '{{.SELECTION_AUTH | default ""}}'
         SELECTION_MODEL: '{{.SELECTION_MODEL | default ""}}'
         SELECTION_TEMPLATE: '{{.SELECTION_TEMPLATE | default ""}}'
+        SELECTION_FORCE: '{{.SELECTION_FORCE | default "false"}}'
         SELECTION_SPEC: '{{.SELECTION_SPEC | default ""}}'
 
