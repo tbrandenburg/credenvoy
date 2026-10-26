@@ -19,7 +19,7 @@
 
 Claude Code wants one shape. OpenCode wants another. Pi, Codex, and Copilot have their own rules—and an API key is a different credential from a subscription login.
 
-**Credenvoy turns explicit profiles and environment variables into the configuration each CLI expects.** Run `task install` once, then launch your agent CLIs normally. Credentials go to their native user locations; private generation and isolated launching are also available.
+**Credenvoy turns explicit profiles and environment variables into the configuration each CLI expects.** Export your credentials and run `task install` once—no profile file is required—then launch your agent CLIs normally. Credentials go to their native user locations; private generation and isolated launching are also available.
 
 Everything that runs Credenvoy lives in **four Taskfiles**. No Python package to install, registry to download, or hidden network bootstrap.
 
@@ -27,7 +27,7 @@ Everything that runs Credenvoy lives in **four Taskfiles**. No Python package to
 - **44 provider/service profiles:** API keys, cloud identity, subscription bundles, and local models.
 - **288 explicit routes:** every configured combination gets a generation route, a gateway requirement, or a clear rejection.
 - **One-call native setup:** `install` compiles your selected profiles directly into normal CLI homes, with private backups and merging.
-- **Review before use:** `install:plan` previews native destinations without writes, CLI commands, or credential values; `plan` previews isolated generation.
+- **Review before use:** `install:plan` previews native destinations without writes, authentication commands, or credential values; `plan` previews isolated generation.
 - **Keep sessions separate:** the launcher isolates agent state and preserves credentials refreshed after bootstrap.
 
 ## Quick start
@@ -43,11 +43,11 @@ If your Python executable is named `python3`, use `task check PYTHON=python3`. T
 
 ### Authenticate your CLIs in one call
 
-Define the CLI/provider combinations in `profiles.json` (see [profile examples](#a-profile-is-deliberately-small)), then supply their credentials through your existing environment or secret manager:
+Install your agent CLIs and supply credentials through your existing environment or secret manager. Without a specification file, Credenvoy detects agents on `PATH`, recognizes supported credential variables, and installs compatible native authentication:
 
 ```sh
 task install:plan       # optional preview of the real destinations
-task install            # compiles and installs all selected profiles
+task install            # discovers compatible native authentication and installs it
 
 # Launch normally, from any directory. No Credenvoy launcher is needed.
 codex
@@ -57,13 +57,63 @@ claude
 copilot
 ```
 
-Only launch the CLIs you selected in your profiles. `install` reads the specification and environment directly: **no `task generate`, generated directory, shell sourcing, or profile wrapper is required.** To install one profile from a larger specification:
+Only launch the CLIs reported as selected. **No profile creation, `task generate`, generated directory, shell sourcing, or wrapper is required.** You can narrow discovery or provision a specific CLI directly:
+
+```sh
+task install AGENTS=pi PROVIDER=groq
+task install AGENTS=codex PROVIDER=openai AUTH=api_key
+task install PROVIDER=openai-chatgpt
+task install TEMPLATE=codex-chatgpt
+task templates
+```
+
+Credentials stay in environment variables; these parameters contain only selectors. Multiple agents use a comma-separated list, for example `AGENTS=pi,opencode`. Explicit canonical adapters such as `AGENTS=pi` or `AGENTS=opencode-v1` can provision file-based routes before the CLI is installed. The `opencode` alias and automatic discovery inspect `opencode --version` and select V1 or V2; an unknown major version fails.
+
+| Task parameter | Meaning | Equivalent environment variable |
+|---|---|---|
+| `AGENTS` | Comma-separated adapters, or `opencode` for version detection | `AGENTCFG_AGENTS` |
+| `PROVIDER` | One provider/service ID from `task matrix` | `AGENTCFG_PROVIDER` |
+| `AUTH` | One authentication mode, such as `api_key`, `subscription`, or `oauth` | `AGENTCFG_AUTH` |
+| `MODEL` | Explicit model selection where desired or required | `AGENTCFG_MODEL` |
+| `TEMPLATE` | Named selector defaults from `task templates` | `AGENTCFG_TEMPLATE` |
+| `SPEC` | Explicit advanced JSON specification file | `AGENTCFG_SPEC` |
+| `FORCE` | Permit existing-file/native-store replacement, with backups | `AGENTCFG_FORCE` |
+
+Available templates are `codex-chatgpt`, `claude-subscription`, `openai-api`, `groq-api`, and `github-copilot`. Templates select agents/providers/authentication; they contain no credentials or fixed model IDs. Direct selectors override template defaults. Templates with no fixed agent list detect installed agents.
+
+**Selection order:** direct selectors/templates take precedence over an implicit `profiles.json`. Otherwise, inline `AGENT_CONFIG_SPEC`, an explicit `SPEC`/`AGENTCFG_SPEC`, or an existing `profiles.json` retain the specification workflow. When none exists, installation discovers automatically. Combining direct selectors with an explicit specification or inline JSON is rejected; a malformed/missing explicitly selected specification never falls back to discovery. Specifications remain useful for custom gateways, nonstandard credential variable names, legacy conversions and detailed setup:
+
+```sh
+task install SPEC=work.json
+```
+
+To install one named profile from a larger specification:
 
 ```sh
 AGENTCFG_PROFILE=codex-chatgpt task install
 ```
 
-Stop running CLI sessions before installation. Installing is an explicit credential replacement operation; the CLIs can refresh the installed credentials afterward. Re-running installation with a stale OAuth bundle can replace newer tokens. Routine CLI launches never reinstall snapshots.
+Discovery uses the registry's conventional key names, accepted aliases and per-agent key overrides. Native subscriptions require the matching CLI's explicit environment bundle, such as `CODEX_AUTH_JSON`, `CLAUDE_AUTH_JSON`, `PI_OPENAI_CODEX_OAUTH_JSON`, `OPENCODE_V1_OPENAI_OAUTH_JSON` or `OPENCODE_OPENAI_AUTH_EXPORT_JSON`. Copilot uses the existing `GITHUB_COPILOT_OAUTH_TOKEN`/`COPILOT_GITHUB_TOKEN` routes. Discovery does not read existing login caches as credential sources, perform OAuth login flows, guess gateways or translate Codex credentials into OpenCode credentials.
+
+Discovery preserves existing model/default selections unless you supply `MODEL`. API-key routes that need a custom Pi model definition require `MODEL`; incomplete routes are reported as skipped. Generic AWS/GCP identity variables do not imply a model-service choice: select a cloud `PROVIDER` explicitly to use ambient identity. Service-specific bearer tokens and the registry's API-key variables can be recognized automatically.
+
+**Unattended selection never prompts.** When multiple compatible credentials are present, Credenvoy prefers `subscription`, then `oauth`, `github_token`, `bearer`, `ambient`, `api_key`, and `keyless`. A subscription replaces the competing API-key candidate for the same provider or single-identity CLI. Pi/OpenCode can retain credentials for distinct providers. Shared key products prefer the explicitly listed plan variants (for example, `zai-coding-plan` and `opencode-go`), then registry order breaks remaining ties, including regional choices. Single-identity ties also use registry order. The log reports selected/skipped routes without values; use `PROVIDER` or `AUTH` to override the default. Discovery API-key aliases prefer the per-agent override, then the canonical variable, then aliases in registry order. Malformed subscription bundles and invalid inputs remain errors; credentials are never translated into a different client's scopes or silently replaced by API billing after validation failure. Unsupported native mappings are reported as skipped.
+
+**Existing changes require force.** New files install without a prompt. If the selected installation would change an existing file, it fails before any file writes or authentication commands. Authorize replacement explicitly for unattended reruns:
+
+```sh
+task install FORCE=true
+# Or: AGENTCFG_FORCE=true task install
+# Standalone: python credenvoy.py install --force
+```
+
+Unchanged files preserve their original bytes, comments and layout and need no force or new backup. `FORCE=true` keeps private backups, merges valid configuration while preserving unrelated entries, and permits replacing malformed native JSON/TOML files after saving their original bytes. It does not bypass symlink checks, invalid inputs, unsupported CLI capabilities or concurrent-change detection. The complete plan is guarded, so one existing change blocks all writes when force is absent.
+
+Native credential stores can also be overwritten: an existing OpenCode V2 database requires force, and Copilot login requires force because the OS credential store is opaque. With force, OpenCode V2 backs up its database and uses noninteractive standalone logout/import/switch commands to replace a changed credential ID and select the requested account; other stored accounts remain. Native keychain/import effects still cannot be rolled back as one file transaction.
+
+The preview may execute a local OpenCode version probe; it never installs files or invokes authentication/import commands. The standalone export accepts matching flags, for example `python credenvoy.py install --agents pi --provider groq`.
+
+Stop running CLI sessions before forced installation. `FORCE=true` authorizes credential replacement; the CLIs can refresh the installed credentials afterward. Re-running installation with a stale OAuth bundle can replace newer tokens. Routine CLI launches never reinstall snapshots.
 
 | Adapter | Native installation target / operation |
 |---|---|
@@ -76,20 +126,22 @@ Stop running CLI sessions before installation. Installing is an explicit credent
 
 Existing `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `COPILOT_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG`, and `OPENCODE_DB` overrides are honored. Overrides must be absolute; installer targets containing symlinks are rejected. Point an override at the physical directory if you manage dotfiles through symlinks. File-only routes can be configured before installing the CLI; native command routes require the corresponding CLI and flags. An installed OpenCode binary must match the selected major version; V1 and V2 cannot be mixed in one native installation.
 
-**Merging and backups.** Unrelated provider credentials and settings survive. Selected provider credentials are replaced as complete entries, so old OAuth fields cannot contaminate API-key credentials. Codex has one native identity file, so its supplied auth bundle replaces that file as a whole. A changed existing file gets an exact private sibling backup named `<filename>.credenvoy-backup-<unique-id>`. Existing OpenCode V2 databases get a SQLite snapshot that includes committed WAL data. No-op file installations create no extra backups. New directories use mode `0700` and files/backups `0600` on Unix; these modes do not establish Windows ACLs.
+**Merging and backups.** Unrelated provider credentials and settings survive. With force, selected provider credentials are replaced as complete entries, so old OAuth fields cannot contaminate API-key credentials. Codex has one native identity file, so its supplied auth bundle replaces that file as a whole. A changed existing file gets an exact private sibling backup named `<filename>.credenvoy-backup-<unique-id>`. Existing OpenCode V2 databases get a SQLite snapshot that includes committed WAL data. No-op file installations create no extra backups. New directories use mode `0700` and files/backups `0600` on Unix; these modes do not establish Windows ACLs.
 
-JSONC comments and trailing commas are accepted. Modified configuration is serialized as JSON/TOML: **values are preserved, comments and layout are normalized**. Exact originals remain in backups. When several profiles configure one CLI, providers accumulate and the last profile's model/default wins; conflicting profiles for the same CLI/provider fail before writes. Use `AGENTCFG_PROFILE` to select a single account/default.
+JSONC comments and trailing commas are accepted. Unchanged files retain their exact original content. Modified configuration is serialized as JSON/TOML: **values are preserved, comments and layout are normalized**. Exact originals remain in backups. When several profiles configure one CLI, providers accumulate and the last profile's model/default wins; competing credentials are resolved by the documented subscription-first priority. Use `AGENTCFG_PROFILE` to select a single account/default.
 
 **Installation boundaries.** The compatibility matrix describes generation routes, not universal native installation. `install` prevalidates the complete selection and rejects routes whose persistent native mapping is not implemented:
 
 - Copilot BYOK currently uses the isolated `task run` route. Although current Copilot documents `providers.json`, this installer does not guess its provider/model schema.
 - Codex and OpenCode routes requiring extra cloud/environment variables currently require `task run` (or separately maintained ambient cloud setup). Pi can persist provider-scoped environment values in its native API-key credential; Claude stores them in `settings.json.env`. External ADC files, AWS profiles and identity refresh remain external dependencies.
-- OpenCode V2 import is additive. The installer checks an existing database through native auth export and rejects a different credential or active selection for the same integration. Use OpenCode's auth commands to remove/select that credential before reinstalling; the installer does not mutate database tables directly. V2 model choice remains the CLI's own selection/`--model` behavior.
+- Isolated OpenCode V2 bootstrap import remains additive. Native forced installation additionally uses examined standalone logout/import/switch commands for replacement and selection. The installer never edits database tables directly. V2 model choice remains the CLI's own selection/`--model` behavior.
 - Claude's native file bundle does not provision an OS keychain. Existing keychain credentials or higher-priority shell/project/managed settings can override installed files. API keys written to Claude settings follow its API billing behavior.
 
 Installation resolves Pi API keys and Codex custom-provider bearer/header credentials into private native files so those routes work after the original environment variables are unset. Pi credential data is escaped to prevent it from being interpreted as a command or environment template. Installing does not mint subscriptions, validate model entitlements, or test provider inference.
 
 All file plans and native command capabilities are checked before file writes. Unexpected failures roll back Credenvoy's own file replacements when they still match what it wrote. Native login/import may have external effects (including keychains) that cannot be rolled back as one transaction. Backups remain beside their targets for recovery. Keep them private and remove them after verifying the new setup.
+
+Native V2 replacement command contract: [examined logout/switch arguments](https://github.com/anomalyco/opencode/blob/b6cbbd7646ec7a05945db3e7f499c9ae5af0b3d1/packages/cli/src/commands/commands.ts) and [logout handler](https://github.com/anomalyco/opencode/blob/b6cbbd7646ec7a05945db3e7f499c9ae5af0b3d1/packages/cli/src/commands/handlers/auth/logout.ts).
 
 Native references: [Copilot token login](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference), [Copilot configuration](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference), [Pi providers](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/providers.md), [Codex configuration](https://developers.openai.com/codex/config-reference/), [examined OpenCode V2 importer](https://github.com/anomalyco/opencode/blob/b6cbbd7646ec7a05945db3e7f499c9ae5af0b3d1/packages/cli/src/commands/handlers/auth/import.ts).
 
@@ -182,8 +234,9 @@ Model IDs are provider-specific. Credenvoy requires your choice rather than gues
 | `task matrix:markdown` | Print the same matrix as a readable Markdown table |
 | `task validate` | Validate selected inputs without writing configuration |
 | `task plan` | Validate and list the native files that will be generated |
-| `task install:plan` | Preview native installation destinations without changing CLI state |
-| `task install` | Install selected credentials and configuration in normal CLI locations |
+| `task install:plan` | Preview selected native routes and destinations; may probe OpenCode version |
+| `task install` | Discover/select and install native credentials; profiles are optional |
+| `task templates` | List predefined credential-free selector templates |
 | `task generate` | Generate all selected profiles into a new private directory |
 | `task run` | Launch `AGENTCFG_PROFILE` with its generated configuration |
 | `task lint` | Check embedded runtime syntax and catalog invariants |
@@ -198,7 +251,7 @@ Available examples: `local`, `openai`, `suite`, `gateway`, `codex-to-opencode-le
 
 | Environment variable | Purpose | Default |
 |---|---|---|
-| `AGENTCFG_SPEC` | Profile JSON file | `profiles.json` |
+| `AGENTCFG_SPEC` | Explicit profile JSON file; install discovers when no default file exists | `profiles.json` when present |
 | `AGENT_CONFIG_SPEC` | Complete profile document as JSON; overrides the file | Unset |
 | `AGENTCFG_OUTPUT` | New generation directory | `generated` |
 | `AGENTCFG_PROFILE` | Generated profile to launch | Required for `run` |
