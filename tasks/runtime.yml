@@ -1323,7 +1323,7 @@ vars:
             check=True,
             timeout=10,
         )
-        match = re.search(r"\b(\d+)\.\d+\.\d+\b", result.stdout)
+        match = re.search(r"\bv?(\d+)\.\d+\.\d+\b", result.stdout)
         if not match or match[1] not in ("1", "2"):
             raise InstallError(
                 "Cannot identify a supported OpenCode major version; use AGENTS=opencode-v1 or opencode-v2"

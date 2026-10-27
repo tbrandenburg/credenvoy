@@ -1431,27 +1431,38 @@ vars:
             self.assertIn("Selected pi/groq/api_key", output.getvalue())
 
         def test_detection_only_selects_installed_agents_and_opencode_major(self):
-            with (
-                self.detected({"pi", "codex", "opencode"}),
-                patch(
-                    "credenvoy.installer.subprocess.run",
-                    return_value=SimpleNamespace(stdout="opencode 2.4.1", stderr=""),
-                ) as version,
+            for output, adapter in (
+                ("opencode 2.4.1", "opencode-v2"),
+                ("opencode v2.0.28", "opencode-v2"),
+                ("opencode v1.2.27", "opencode-v1"),
             ):
-                self.assertEqual(
-                    install.select_agents(None), ["codex", "pi", "opencode-v2"]
-                )
-            self.assertEqual(version.call_count, 1)
-            self.assertEqual(version.call_args.args[0][-1], "--version")
-            with (
-                self.detected({"opencode"}),
-                patch(
-                    "credenvoy.installer.subprocess.run",
-                    return_value=SimpleNamespace(stdout="3.0.0", stderr=""),
-                ),
-            ):
-                with self.assertRaises(install.InstallError):
-                    install.select_agents("opencode")
+                with (
+                    self.subTest(output=output),
+                    self.detected({"pi", "codex", "opencode"}),
+                    patch(
+                        "credenvoy.installer.subprocess.run",
+                        return_value=SimpleNamespace(stdout=output, stderr=""),
+                    ) as version,
+                ):
+                    self.assertEqual(
+                        install.select_agents(None), ["codex", "pi", adapter]
+                    )
+                    self.assertEqual(version.call_count, 1)
+                    self.assertEqual(version.call_args.args[0][-1], "--version")
+            for output in ("3.0.0", "opencode v3.0.0", "opencode preview2.0.28"):
+                with (
+                    self.subTest(output=output),
+                    self.detected({"opencode"}),
+                    patch(
+                        "credenvoy.installer.subprocess.run",
+                        return_value=SimpleNamespace(stdout=output, stderr=""),
+                    ) as version,
+                ):
+                    with self.assertRaisesRegex(
+                        install.InstallError, "Cannot identify a supported OpenCode major"
+                    ):
+                        install.select_agents("opencode")
+                    version.assert_called_once()
             with self.detected(set()):
                 with self.assertRaisesRegex(install.InstallError, "No supported agents"):
                     install.select_agents(None)
