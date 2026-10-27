@@ -303,6 +303,8 @@ OpenCode V1 and V2 are separate adapters. V2 uses an isolated database and impor
 
 Files are created with Unix mode `0600`, directories with `0700`. The launcher checks OpenCode's major version and rejects old Pi versions with different env-reference semantics. Windows ACL hardening and other release-level compatibility checks remain limitations; Windows CI tests configuration behavior, not live credential isolation.
 
+CLI version detection accepts bare versions and a leading `v`, including OpenCode V2's `opencode v2.0.28` output. This check is shared by isolated launches and native installation; a different OpenCode major version is still rejected.
+
 Credenvoy does not synchronize rotating OAuth state between machines, log into cloud providers, create API keys, or change your default home-directory agent configuration. Project-local settings and external cloud identity sources can still influence the agent itself.
 
 ## Small repository, explicit responsibilities
@@ -345,4 +347,3 @@ The suite is a configuration generator with synthetic validation. Live provider 
 ## License
 
 [MIT](LICENSE). Upstream provider-data attribution is recorded in [NOTICE](NOTICE).
-
