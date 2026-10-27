@@ -73,13 +73,34 @@ tasks:
     - task: catalog:_dispatch
       vars:
         ACTION: install
+        SELECTION_AGENTS: '{{.AGENTS | default .AGENTCFG_AGENTS | default ""}}'
+        SELECTION_PROVIDER: '{{.PROVIDER | default .AGENTCFG_PROVIDER | default ""}}'
+        SELECTION_AUTH: '{{.AUTH | default .AGENTCFG_AUTH | default ""}}'
+        SELECTION_MODEL: '{{.MODEL | default .AGENTCFG_MODEL | default ""}}'
+        SELECTION_TEMPLATE: '{{.TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+        SELECTION_FORCE: '{{.FORCE | default .AGENTCFG_FORCE | default "false"}}'
+        SELECTION_SPEC: '{{.SPEC | default .AGENTCFG_SPEC | default ""}}'
   install:plan:
-    desc: Preview native installation destinations without writes or CLI commands
+    desc: Preview native installation; discovery may probe OpenCode version
     silent: true
     cmds:
     - task: catalog:_dispatch
       vars:
         ACTION: install:plan
+        SELECTION_AGENTS: '{{.AGENTS | default .AGENTCFG_AGENTS | default ""}}'
+        SELECTION_PROVIDER: '{{.PROVIDER | default .AGENTCFG_PROVIDER | default ""}}'
+        SELECTION_AUTH: '{{.AUTH | default .AGENTCFG_AUTH | default ""}}'
+        SELECTION_MODEL: '{{.MODEL | default .AGENTCFG_MODEL | default ""}}'
+        SELECTION_TEMPLATE: '{{.TEMPLATE | default .AGENTCFG_TEMPLATE | default ""}}'
+        SELECTION_FORCE: '{{.FORCE | default .AGENTCFG_FORCE | default "false"}}'
+        SELECTION_SPEC: '{{.SPEC | default .AGENTCFG_SPEC | default ""}}'
+  templates:
+    desc: List predefined native-install selector templates
+    silent: true
+    cmds:
+    - task: catalog:_dispatch
+      vars:
+        ACTION: templates
   run:
     desc: Launch AGENTCFG_PROFILE with isolated agent state
     silent: true

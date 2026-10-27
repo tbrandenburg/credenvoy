@@ -49,6 +49,7 @@ jobs:
           import pathlib
           import shutil
           import subprocess
+          import sys
           import tempfile
 
           with tempfile.TemporaryDirectory() as temporary:
@@ -88,6 +89,66 @@ jobs:
               auth = json.loads((native_home / 'auth.json').read_text(encoding='utf-8'))
               assert auth['groq']['key'] == 'SYNTHETIC-CI-KEY'
               assert not (root / 'generated').exists()
+
+              # Discover a synthetic Pi executable on PATH without running an agent.
+              shim = root / 'agent-bin'
+              shim.mkdir()
+              executable = shim / ('pi.cmd' if os.name == 'nt' else 'pi')
+              executable.write_text('@exit /b 0\n' if os.name == 'nt' else '#!/bin/sh\nexit 0\n', encoding='utf-8')
+              executable.chmod(0o700)
+              task_executable = shutil.which('task')
+              minimal = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'PATHEXT') if key in os.environ}
+              minimal.update(PATH=str(shim), PYTHON=sys.executable, PYTHONUTF8='1', GROQ_API_KEY='SYNTHETIC-DISCOVERY-KEY')
+              for label, selectors in (
+                  ('automatic', []),
+                  ('parameters', ['AGENTS=pi', 'PROVIDER=groq', 'AUTH=api_key', 'MODEL=literal $(touch SHOULD_NOT_EXIST)']),
+                  ('template', ['AGENTS=pi', 'TEMPLATE=groq-api']),
+              ):
+                  destination = root.resolve() / label
+                  environment = {**minimal, 'PI_CODING_AGENT_DIR': str(destination)}
+                  for action in ('install:plan', 'install'):
+                      result = subprocess.run(
+                          [task_executable, action, "PYTHON=" + sys.executable, *selectors], cwd=root, env=environment,
+                          check=True, capture_output=True, text=True,
+                      )
+                      assert 'SYNTHETIC-DISCOVERY-KEY' not in result.stdout + result.stderr
+                      if action == 'install:plan':
+                          assert not destination.exists()
+                  auth = json.loads((destination / 'auth.json').read_text(encoding='utf-8'))
+                  assert auth['groq']['key'] == 'SYNTHETIC-DISCOVERY-KEY'
+                  if label == 'parameters':
+                      settings = json.loads((destination / 'settings.json').read_text(encoding='utf-8'))
+                      assert settings['defaultModel'] == 'literal $(touch SHOULD_NOT_EXIST)'
+                  assert not (root / 'SHOULD_NOT_EXIST').exists()
+
+                  # Repeat without force is a semantic no-op; changed credentials need force.
+                  original = (destination / 'auth.json').read_bytes()
+                  subprocess.run([task_executable, 'install', "PYTHON=" + sys.executable, *selectors], cwd=root, env=environment, check=True, capture_output=True, text=True)
+                  assert (destination / 'auth.json').read_bytes() == original
+                  assert not list(destination.glob('*.credenvoy-backup-*'))
+                  rotated = {**environment, 'GROQ_API_KEY': 'SYNTHETIC-ROTATED-KEY'}
+                  blocked = subprocess.run([task_executable, 'install', "PYTHON=" + sys.executable, *selectors], cwd=root, env=rotated, capture_output=True, text=True)
+                  assert blocked.returncode != 0 and 'FORCE=true' in blocked.stderr
+                  assert (destination / 'auth.json').read_bytes() == original
+                  forced = subprocess.run([task_executable, 'install', 'FORCE=true', "PYTHON=" + sys.executable, *selectors], cwd=root, env=rotated, check=True, capture_output=True, text=True)
+                  assert 'SYNTHETIC-ROTATED-KEY' not in forced.stdout + forced.stderr
+                  assert json.loads((destination / 'auth.json').read_text(encoding='utf-8'))['groq']['key'] == 'SYNTHETIC-ROTATED-KEY'
+                  assert next(destination.glob('auth.json.credenvoy-backup-*')).read_bytes() == original
+              assert not (root / 'profiles.json').exists()
+
+              # Subscription wins over an API key on a fake installed Codex CLI.
+              subscription_bin = root / 'subscription-bin'
+              subscription_bin.mkdir()
+              codex = subscription_bin / ('codex.cmd' if os.name == 'nt' else 'codex')
+              codex.write_text('@exit /b 0\n' if os.name == 'nt' else '#!/bin/sh\nexit 0\n', encoding='utf-8')
+              codex.chmod(0o700)
+              native = {'tokens': {'access_token': 'SYNTHETIC-ACCESS', 'refresh_token': 'SYNTHETIC-REFRESH', 'id_token': 'SYNTHETIC-ID'}}
+              environment = {**minimal, 'PATH': str(subscription_bin), 'CODEX_HOME': str(root.resolve() / 'subscription-codex'), 'OPENAI_API_KEY': 'SYNTHETIC-API', 'CODEX_AUTH_JSON': json.dumps(native)}
+              result = subprocess.run([task_executable, 'install', "PYTHON=" + sys.executable], cwd=root, env=environment, check=True, capture_output=True, text=True)
+              assert 'Selected codex/openai-chatgpt/subscription' in result.stdout
+              installed = json.loads((root / 'subscription-codex/auth.json').read_text(encoding='utf-8'))
+              assert installed == native and 'OPENAI_API_KEY' not in installed
+              assert 'SYNTHETIC-API' not in result.stdout + result.stderr
 
       - name: Check generated examples for drift
         run: task examples:check

@@ -844,7 +844,7 @@ vars:
 
         def apply(self, plan):
             with contextlib.redirect_stdout(io.StringIO()):
-                install.apply(plan)
+                install.apply(plan, force=True)
 
         def read(self, path):
             return json.loads(path.read_text(encoding="utf-8"))
@@ -1163,18 +1163,20 @@ vars:
                         SimpleNamespace(stdout="--standalone", stderr=""),
                         SimpleNamespace(stdout="2.0.0", stderr=""),
                         SimpleNamespace(stdout="[]", stderr=""),
+                        SimpleNamespace(stdout="--standalone credential", stderr=""),
+                        SimpleNamespace(stdout="", stderr=""),
                         SimpleNamespace(stdout="", stderr=""),
                     ],
                 ) as call,
                 patch("credenvoy.installer.sqlite3.connect", side_effect=track_connection),
             ):
                 self.apply(plan)
-            self.assertEqual(call.call_count, 4)
+            self.assertEqual(call.call_count, 6)
             self.assertEqual(len(opened), 2)
             for connection in opened:
                 with self.assertRaises(sqlite3.ProgrammingError):
                     connection.execute("SELECT 1")
-            args, kwargs = call.call_args
+            args, kwargs = call.call_args_list[-2]
             self.assertEqual(args[0], ["opencode", "auth", "import", "--standalone"])
             self.assertEqual(
                 json.loads(kwargs["input"])[0]["value"]["key"], os.environ["TEST_KEY"]
@@ -1186,7 +1188,7 @@ vars:
                     connection.execute("SELECT value FROM keep").fetchone(), ("KEEP",)
                 )
 
-        def test_v2_conflicting_existing_credentials_fail_before_file_writes(self):
+        def test_v2_existing_database_requires_force_before_subprocesses(self):
             db = self.home / ".local/share/opencode/opencode.db"
             db.parent.mkdir(parents=True)
             with contextlib.closing(sqlite3.connect(db)):
@@ -1198,26 +1200,12 @@ vars:
                 )
             )
             plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
-            results = [
-                SimpleNamespace(stdout="--standalone", stderr=""),
-                SimpleNamespace(stdout="2.0.0", stderr=""),
-                SimpleNamespace(
-                    stdout=json.dumps(
-                        [
-                            {
-                                "id": "other",
-                                "integrationID": "openai",
-                                "value": {"key": "EXISTING"},
-                                "active": True,
-                            }
-                        ]
-                    ),
-                    stderr="",
-                ),
-            ]
-            with patch("credenvoy.installer.subprocess.run", side_effect=results):
-                with self.assertRaises(install.InstallError):
-                    self.apply(plan)
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                side_effect=AssertionError("No commands before force"),
+            ):
+                with self.assertRaisesRegex(install.InstallError, "FORCE=true"):
+                    install.apply(plan)
             self.assertFalse((self.home / ".pi").exists())
 
         def test_copilot_login_uses_native_store_and_suppresses_output(self):
@@ -1390,6 +1378,544 @@ vars:
                     install.InstallError, "explicit CLI home/config override"
                 ):
                     install.destinations("pi")
+
+        def resolve(self, **values):
+            args = SimpleNamespace(
+                spec=None,
+                profile=None,
+                agents=None,
+                provider=None,
+                auth=None,
+                model=None,
+                template=None,
+            )
+            for key, value in values.items():
+                setattr(args, key, value)
+            with contextlib.chdir(self.home):
+                return install.resolve_inputs(args)
+
+        def detected(self, names):
+            return patch(
+                "credenvoy.installer.shutil.which",
+                side_effect=lambda name: str(self.home / name) if name in names else None,
+            )
+
+        def test_discovery_installs_multiple_pi_providers_without_models_or_profiles(self):
+            settings = self.home / ".pi/agent/settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(
+                '{"defaultProvider":"keep","defaultModel":"keep-model"}', encoding="utf-8"
+            )
+            with (
+                self.detected({"pi"}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "GROQ_API_KEY": "SYNTHETIC-GROQ",
+                        "OPENAI_API_KEY": "SYNTHETIC-OPENAI",
+                    },
+                ),
+                contextlib.chdir(self.home),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                install.main([])
+            auth = self.read(self.home / ".pi/agent/auth.json")
+            self.assertEqual(auth["groq"]["key"], "SYNTHETIC-GROQ")
+            self.assertEqual(auth["openai"]["key"], "SYNTHETIC-OPENAI")
+            self.assertEqual(
+                self.read(settings),
+                {"defaultProvider": "keep", "defaultModel": "keep-model"},
+            )
+            self.assertFalse((self.home / "profiles.json").exists())
+            self.assertNotIn("SYNTHETIC-GROQ", output.getvalue())
+            self.assertIn("Selected pi/groq/api_key", output.getvalue())
+
+        def test_detection_only_selects_installed_agents_and_opencode_major(self):
+            with (
+                self.detected({"pi", "codex", "opencode"}),
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    return_value=SimpleNamespace(stdout="opencode 2.4.1", stderr=""),
+                ) as version,
+            ):
+                self.assertEqual(
+                    install.select_agents(None), ["codex", "pi", "opencode-v2"]
+                )
+            self.assertEqual(version.call_count, 1)
+            self.assertEqual(version.call_args.args[0][-1], "--version")
+            with (
+                self.detected({"opencode"}),
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    return_value=SimpleNamespace(stdout="3.0.0", stderr=""),
+                ),
+            ):
+                with self.assertRaises(install.InstallError):
+                    install.select_agents("opencode")
+            with self.detected(set()):
+                with self.assertRaisesRegex(install.InstallError, "No supported agents"):
+                    install.select_agents(None)
+                self.assertEqual(install.select_agents("pi,pi,codex"), ["pi", "codex"])
+
+        def test_direct_parameters_use_registry_and_require_no_executable_for_file_routes(
+            self,
+        ):
+            with (
+                self.detected(set()),
+                patch.dict(os.environ, {"GROQ_API_KEY": "SYNTHETIC"}),
+            ):
+                raw, notes = self.resolve(agents="pi", provider="groq", auth="api_key")
+            self.assertEqual(len(raw["profiles"]), 1)
+            self.assertEqual(raw["profiles"][0]["provider"], "groq")
+            self.assertTrue(raw["profiles"][0]["auth_only"])
+            self.assertNotIn("model", raw["profiles"][0])
+            self.assertIn("Selected pi/groq/api_key", notes)
+
+        def test_named_template_selects_codex_subscription_without_model(self):
+            native = {
+                "tokens": {
+                    "access_token": "SYNTHETIC",
+                    "refresh_token": "SYNTHETIC",
+                    "id_token": "SYNTHETIC",
+                }
+            }
+            with patch.dict(os.environ, {"CODEX_AUTH_JSON": json.dumps(native)}):
+                raw, _ = self.resolve(template="codex-chatgpt")
+            self.assertEqual(raw["profiles"][0]["agent"], "codex")
+            self.assertEqual(raw["profiles"][0]["provider"], "openai-chatgpt")
+            with self.assertRaises(install.InstallError):
+                self.resolve(template="unknown")
+
+        def test_codex_subscription_wins_over_api_without_prompting(self):
+            native = {
+                "tokens": {
+                    "access_token": "SYNTHETIC",
+                    "refresh_token": "SYNTHETIC",
+                    "id_token": "SYNTHETIC",
+                }
+            }
+            with patch.dict(
+                os.environ,
+                {"CODEX_AUTH_JSON": json.dumps(native), "OPENAI_API_KEY": "SYNTHETIC"},
+            ):
+                raw, notes = self.resolve(agents="codex")
+                self.assertEqual(len(raw["profiles"]), 1)
+                self.assertEqual(raw["profiles"][0]["provider"], "openai-chatgpt")
+                self.assertTrue(any("higher-priority" in note for note in notes))
+                raw, _ = self.resolve(agents="codex", auth="api_key")
+                self.assertEqual(raw["profiles"][0]["provider"], "openai")
+            self.assertFalse((self.home / ".codex").exists())
+
+        def test_shared_product_keys_choose_plan_then_registry_order(self):
+            with patch.dict(os.environ, {"ZAI_API_KEY": "SYNTHETIC"}):
+                raw, _ = self.resolve(agents="pi")
+                self.assertEqual(
+                    [p["provider"] for p in raw["profiles"]], ["zai-coding-plan"]
+                )
+            with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "SYNTHETIC"}):
+                raw, _ = self.resolve(agents="opencode-v1")
+                self.assertEqual([p["provider"] for p in raw["profiles"]], ["alibaba"])
+            self.assertFalse((self.home / ".pi").exists())
+
+        def test_opencode_subscription_oauth_wins_over_api_key(self):
+            oauth = {
+                "type": "oauth",
+                "access": "SYNTHETIC",
+                "refresh": "SYNTHETIC",
+                "expires": 1900000000000,
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENAI_API_KEY": "SYNTHETIC",
+                    "OPENCODE_V1_OPENAI_OAUTH_JSON": json.dumps(oauth),
+                },
+            ):
+                raw, _ = self.resolve(agents="opencode-v1")
+            self.assertEqual([p["provider"] for p in raw["profiles"]], ["openai-chatgpt"])
+
+        def test_discovery_never_converts_codex_tokens_to_opencode_implicitly(self):
+            with patch.dict(
+                os.environ, {"CODEX_AUTH_JSON": '{"tokens":{"access_token":"SYNTHETIC"}}'}
+            ):
+                with self.assertRaisesRegex(
+                    install.InstallError, "No installable credentials"
+                ):
+                    self.resolve(agents="opencode-v1")
+            self.assertFalse((self.home / ".local").exists())
+
+        def test_unsupported_native_routes_are_reported_and_not_misrepresented(self):
+            with patch.dict(os.environ, {"GROQ_API_KEY": "SYNTHETIC"}):
+                raw, notes = self.resolve(agents="pi,copilot,codex")
+            self.assertEqual([p["agent"] for p in raw["profiles"]], ["pi"])
+            self.assertTrue(
+                any("copilot/groq" in note and "not implemented" in note for note in notes)
+            )
+            self.assertTrue(
+                any("codex/groq" in note and "gateway" in note for note in notes)
+            )
+
+        def test_ambient_cloud_identity_is_only_selected_explicitly(self):
+            with (
+                self.detected({"pi"}),
+                patch.dict(os.environ, {"AWS_PROFILE": "SYNTHETIC"}),
+            ):
+                with self.assertRaises(install.InstallError):
+                    self.resolve()
+                raw, _ = self.resolve(
+                    agents="pi", provider="amazon-bedrock", auth="ambient"
+                )
+                self.assertEqual(raw["profiles"][0]["auth"], "ambient")
+
+        def test_custom_pi_endpoint_requires_explicit_model(self):
+            with patch.dict(
+                os.environ, {"DEEPINFRA_API_KEY": "SYNTHETIC", "GROQ_API_KEY": "SYNTHETIC"}
+            ):
+                raw, notes = self.resolve(agents="pi")
+                self.assertEqual([p["provider"] for p in raw["profiles"]], ["groq"])
+                self.assertTrue(
+                    any("pi/deepinfra" in note and "model" in note for note in notes)
+                )
+                with self.assertRaises(install.InstallError):
+                    self.resolve(agents="pi", provider="deepinfra")
+                raw, _ = self.resolve(
+                    agents="pi", provider="deepinfra", model="synthetic-model"
+                )
+                self.assertEqual(raw["profiles"][0]["model"], "synthetic-model")
+
+        def test_canonical_key_alias_wins_without_echoing_values(self):
+            with patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "DO_NOT_LEAK_ONE", "GOOGLE_API_KEY": "DO_NOT_LEAK_TWO"},
+            ):
+                raw, notes = self.resolve(agents="pi", provider="google")
+            self.assertEqual(raw["profiles"][0]["key_env"], "GEMINI_API_KEY")
+            self.assertNotIn("DO_NOT_LEAK", " ".join(notes))
+
+        def test_specification_precedence_and_invalid_files_do_not_fall_back_to_discovery(
+            self,
+        ):
+            spec = {
+                "profiles": [
+                    {
+                        "name": "existing",
+                        "agent": "pi",
+                        "provider": "groq",
+                        "model": "synthetic",
+                    }
+                ]
+            }
+            path = self.home / "profiles.json"
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            self.assertEqual(self.resolve(), (spec, []))
+            with patch.dict(os.environ, {"GROQ_API_KEY": "SYNTHETIC"}):
+                raw, _ = self.resolve(agents="pi", provider="groq")
+                self.assertNotEqual(raw, spec)
+                with self.assertRaises(install.InstallError):
+                    self.resolve(agents="pi", spec=str(path))
+                with patch.dict(os.environ, {"AGENT_CONFIG_SPEC": json.dumps(spec)}):
+                    self.assertEqual(self.resolve(), (spec, []))
+                    with self.assertRaises(install.InstallError):
+                        self.resolve(agents="pi")
+            path.write_text("MALFORMED SYNTHETIC", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.resolve()
+            with self.assertRaises(FileNotFoundError):
+                self.resolve(spec=str(self.home / "missing.json"))
+
+        def test_auth_only_claude_install_preserves_existing_model(self):
+            settings = self.home / ".claude/settings.json"
+            settings.parent.mkdir()
+            settings.write_text(
+                '{"env":{"ANTHROPIC_MODEL":"keep-model"}}', encoding="utf-8"
+            )
+            with (
+                patch.dict(os.environ, {"ANTHROPIC_API_KEY": "SYNTHETIC"}),
+                contextlib.chdir(self.home),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                install.main(["--agents", "claude", "--provider", "anthropic", "--force"])
+            self.assertEqual(self.read(settings)["env"]["ANTHROPIC_MODEL"], "keep-model")
+
+        def test_discovery_preview_does_not_write_or_authenticate(self):
+            with (
+                self.detected({"pi"}),
+                patch.dict(os.environ, {"GROQ_API_KEY": "SYNTHETIC"}),
+                patch(
+                    "credenvoy.installer.subprocess.run",
+                    side_effect=AssertionError("No auth commands"),
+                ),
+                contextlib.chdir(self.home),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                install.main([], dry_run=True)
+            self.assertFalse((self.home / ".pi").exists())
+
+        def test_invalid_selectors_and_no_matching_credentials_fail_cleanly(self):
+            for values in (
+                {"agents": "unknown"},
+                {"agents": "pi", "provider": "unknown"},
+                {"agents": "pi", "auth": "unknown"},
+                {"agents": "pi"},
+                {"profile": "missing"},
+            ):
+                with self.subTest(**values), self.assertRaises(install.InstallError):
+                    self.resolve(**values)
+
+        def test_auth_only_codex_preserves_existing_model_and_default_profile(self):
+            config = self.home / ".codex/config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                'model = "keep-model"\nprofile = "keep-profile"\nmodel_provider = "keep-provider"\n',
+                encoding="utf-8",
+            )
+            with (
+                patch.dict(os.environ, {"OPENAI_API_KEY": "SYNTHETIC"}),
+                contextlib.chdir(self.home),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                install.main(["--agents", "codex", "--provider", "openai", "--force"])
+            parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["model"], "keep-model")
+            self.assertEqual(parsed["profile"], "keep-profile")
+            self.assertEqual(parsed["model_provider"], "keep-provider")
+
+        def test_malformed_subscription_never_falls_back_to_api_billing(self):
+            with patch.dict(
+                os.environ,
+                {"CODEX_AUTH_JSON": "MALFORMED-DO-NOT-LEAK", "OPENAI_API_KEY": "SYNTHETIC"},
+            ):
+                with self.assertRaises(install.InstallError) as error:
+                    self.resolve(agents="codex")
+            self.assertNotIn("MALFORMED-DO-NOT-LEAK", str(error.exception))
+            self.assertFalse((self.home / ".codex").exists())
+
+        def test_complete_shared_product_is_selected_without_questions(self):
+            with patch.dict(
+                os.environ,
+                {
+                    "CLOUDFLARE_API_KEY": "SYNTHETIC",
+                    "CLOUDFLARE_ACCOUNT_ID": "SYNTHETIC-ACCOUNT",
+                },
+            ):
+                raw, _ = self.resolve(agents="pi")
+                self.assertEqual(
+                    [p["provider"] for p in raw["profiles"]], ["cloudflare-workers-ai"]
+                )
+
+        def test_overwrite_guard_blocks_entire_plan_and_force_keeps_exact_backup(self):
+            path = self.home / ".pi/agent/auth.json"
+            path.parent.mkdir(parents=True)
+            original = b'{"groq":{"type":"api_key","key":"OLD"}}'
+            path.write_bytes(original)
+            plan = install.Installation()
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            plan.add(self.profile("codex", api_key_env="TEST_KEY", native_api_key=True))
+            with self.assertRaisesRegex(install.InstallError, "FORCE=true"):
+                install.apply(plan)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse((self.home / ".codex").exists())
+            self.assertEqual(list(path.parent.glob("*.credenvoy-backup-*")), [])
+            self.apply(plan)
+            backup = next(path.parent.glob("auth.json.credenvoy-backup-*"))
+            self.assertEqual(backup.read_bytes(), original)
+            self.assertEqual(
+                self.read(path)["groq"]["key"], install.pi_literal(os.environ["TEST_KEY"])
+            )
+
+        def test_semantic_noop_preserves_bytes_and_needs_no_force(self):
+            path = self.home / ".pi/agent/auth.json"
+            path.parent.mkdir(parents=True)
+            original = (
+                '{"groq":'
+                + json.dumps(
+                    {
+                        "type": "api_key",
+                        "key": install.pi_literal(os.environ["TEST_KEY"]),
+                        "env": {"TEST_KEY": os.environ["TEST_KEY"]},
+                    }
+                )
+                + "}"
+            ).encode()
+            path.write_bytes(original)
+            plan = install.Installation()
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.apply(plan)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.glob("*.credenvoy-backup-*")), [])
+
+        def test_force_can_replace_malformed_native_file_with_backup(self):
+            path = self.home / ".pi/agent/auth.json"
+            path.parent.mkdir(parents=True)
+            original = b"MALFORMED SYNTHETIC ORIGINAL"
+            path.write_bytes(original)
+            with self.assertRaisesRegex(install.InstallError, "FORCE=true"):
+                install.Installation().add(
+                    self.profile("pi", "groq", api_key_env="TEST_KEY")
+                )
+            plan = install.Installation(force=True)
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY"))
+            self.apply(plan)
+            self.assertEqual(
+                next(path.parent.glob("*.credenvoy-backup-*")).read_bytes(), original
+            )
+            self.assertIn("groq", self.read(path))
+
+        def test_force_flag_and_environment_authorize_main_replacement(self):
+            path = self.home / ".pi/agent/auth.json"
+            path.parent.mkdir(parents=True)
+            path.write_text('{"groq":{"type":"api_key","key":"OLD"}}', encoding="utf-8")
+            with (
+                patch.dict(os.environ, {"GROQ_API_KEY": "SYNTHETIC"}),
+                contextlib.chdir(self.home),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit):
+                    install.main(["--agents", "pi", "--provider", "groq"])
+                with patch.dict(os.environ, {"AGENTCFG_FORCE": "true"}):
+                    install.main(["--agents", "pi", "--provider", "groq"])
+            self.assertEqual(self.read(path)["groq"]["key"], "SYNTHETIC")
+            for value, expected in [
+                ("true", True),
+                ("1", True),
+                ("false", False),
+                ("0", False),
+                (None, False),
+            ]:
+                self.assertEqual(install.force_enabled(value), expected)
+            with self.assertRaises(install.InstallError):
+                install.force_enabled("unknown")
+
+        def test_copilot_opaque_store_is_force_guarded_without_probing(self):
+            plan = install.Installation()
+            plan.add(self.profile("copilot", "github-copilot", github_oauth_env="TEST_KEY"))
+            with patch(
+                "credenvoy.installer.subprocess.run",
+                side_effect=AssertionError("No auth command"),
+            ):
+                with self.assertRaisesRegex(install.InstallError, "FORCE=true"):
+                    install.apply(plan)
+
+        def test_explicit_specification_also_prefers_subscription_for_single_identity(self):
+            from credenvoy import compiler
+
+            native = {
+                "tokens": {
+                    "access_token": "SYNTHETIC",
+                    "refresh_token": "SYNTHETIC",
+                    "id_token": "SYNTHETIC",
+                }
+            }
+            raw = [
+                {
+                    "name": "api",
+                    "agent": "codex",
+                    "provider": "openai",
+                    "auth": "api_key",
+                    "auth_only": True,
+                },
+                {
+                    "name": "subscription",
+                    "agent": "codex",
+                    "provider": "openai-chatgpt",
+                    "auth": "subscription",
+                    "auth_only": True,
+                },
+            ]
+            with patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "SYNTHETIC", "CODEX_AUTH_JSON": json.dumps(native)},
+            ):
+                records = [
+                    (request, compiler.compile_profile(request), None) for request in raw
+                ]
+                selected = install.prefer_credentials(records, [])
+            self.assertEqual(selected[0][0]["name"], "subscription")
+            self.assertEqual(len(selected), 1)
+
+        def test_force_rotates_same_v2_id_with_noninteractive_native_commands(self):
+            db = self.home / ".local/share/opencode/opencode.db"
+            db.parent.mkdir(parents=True)
+            with contextlib.closing(sqlite3.connect(db)) as connection, connection:
+                connection.execute("CREATE TABLE keep (value TEXT)")
+            plan = install.Installation(force=True)
+            plan.add(
+                self.profile(
+                    "opencode-v2", api_key_env="TEST_KEY", credential_id="synthetic"
+                )
+            )
+            old = [
+                {
+                    "id": "synthetic",
+                    "integrationID": "openai",
+                    "value": {"type": "key", "key": "OLD"},
+                    "active": True,
+                }
+            ]
+            results = [
+                SimpleNamespace(stdout="--standalone", stderr=""),
+                SimpleNamespace(stdout="2.0.0", stderr=""),
+                SimpleNamespace(stdout=json.dumps(old), stderr=""),
+                SimpleNamespace(stdout="--standalone credential", stderr=""),
+                SimpleNamespace(stdout="--standalone credential", stderr=""),
+                SimpleNamespace(stdout="", stderr=""),
+                SimpleNamespace(stdout="", stderr=""),
+                SimpleNamespace(stdout="", stderr=""),
+            ]
+            with patch("credenvoy.installer.subprocess.run", side_effect=results) as call:
+                self.apply(plan)
+            operations = [entry.args[0] for entry in call.call_args_list]
+            self.assertEqual(
+                operations[-3],
+                ["opencode", "auth", "logout", "openai", "synthetic", "--standalone"],
+            )
+            self.assertEqual(operations[-2], ["opencode", "auth", "import", "--standalone"])
+            self.assertEqual(
+                operations[-1],
+                ["opencode", "auth", "switch", "openai", "synthetic", "--standalone"],
+            )
+            for entry in call.call_args_list[-3:]:
+                self.assertIsNotNone(entry.kwargs["input"])
+                self.assertNotIn(os.environ["TEST_KEY"], str(entry.args))
+            self.assertEqual(len(list(db.parent.glob("*.credenvoy-backup-*"))), 1)
+
+        def test_pi_chatgpt_subscription_suppresses_openai_api_but_keeps_other_providers(
+            self,
+        ):
+            oauth = {
+                "type": "oauth",
+                "access": "SYNTHETIC",
+                "refresh": "SYNTHETIC",
+                "expires": 1900000000000,
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "PI_OPENAI_CODEX_OAUTH_JSON": json.dumps(oauth),
+                    "OPENAI_API_KEY": "SYNTHETIC",
+                    "GROQ_API_KEY": "SYNTHETIC",
+                },
+            ):
+                raw, _ = self.resolve(agents="pi")
+            self.assertEqual(
+                {p["provider"] for p in raw["profiles"]}, {"openai-chatgpt", "groq"}
+            )
+
+        def test_semantic_noop_preserves_jsonc_settings_comments(self):
+            path = self.home / ".pi/agent/settings.json"
+            path.parent.mkdir(parents=True)
+            original = (
+                b'{// KEEP COMMENT\n"defaultProvider":"groq","defaultModel":"synthetic",}'
+            )
+            path.write_bytes(original)
+            plan = install.Installation()
+            plan.add(self.profile("pi", "groq", api_key_env="TEST_KEY", model="synthetic"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.apply(plan)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.glob("*.credenvoy-backup-*")), [])
 tasks:
   run:
     internal: true
